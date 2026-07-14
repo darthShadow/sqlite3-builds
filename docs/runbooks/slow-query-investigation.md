@@ -320,25 +320,33 @@ hand-roll a harness that omits any of them.
    the same timeout wrapper, or: if the arm has already been marked timed-out
    from a prior timed iteration or prior stat-state run for this cell, skip the
    warm-up for that arm entirely.
-   Reference implementation:
-   `.codex.local/emby-slow-search/measure/fh1-measure.sh` wraps both timed
-   iterations and the warm-up via `run_timed_sql_file` (rc=124 on timeout),
-   including the warm-up call around line 1739. Keep that shape: on timeout, set
-   `arm_timed_out[$arm]=1` immediately and skip all subsequent iterations for
-   that arm.
+   Reference implementation: `docs/runbooks/query-measure/query-measure.sh`
+   routes setup and query phases through `run_setup_sql` / `run_query_sql`,
+   wraps pre-warm separately, marks an arm timed out immediately, and skips its
+   subsequent iterations. Its startup source grep rejects an uncapped direct
+   SQLite invocation and rejects SQLite calls from family data files.
 
-2. **Bounded disk footprint.** NEVER materialize all arm×stat copies up front. Use
-   per-candidate 2-arm batches (baseline vs one candidate); `ANALYZE`-in-place for
-   the analyzed state (no separate analyzed copies); delete both copies between
-   candidates; disk-preflight (free >= 2×source-size + margin, else `die`); an
-   EXIT/signal trap that removes this run's copies (never the source or original).
-   Peak <= ~2 DB copies + the source copy. (A full arms×stats materialization is
-   O(copies) × multi-GB and will exhaust the volume.)
+2. **Bounded disk footprint.** NEVER materialize all arm x stat copies up front.
+   Use at most one 2-arm batch (baseline vs one candidate); SQL-only candidates
+   may share one working copy because they change no database state. Apply
+   candidate indexes or `ANALYZE` only to the working copy, never to the source,
+   and do not create separate analyzed copies. Treat the main database and an
+   existing `-wal` as one snapshot: budget and copy both before the first SQLite
+   open. Disk-preflight requires free >= 2 x snapshot-size + margin. Create the
+   per-run directory with `mktemp -d` under the configured scratch root; never
+   reuse a caller-named directory with `mkdir -p`. An EXIT/signal trap removes
+   only the uniquely owned run directory (never the source or original). Peak <=
+   ~2 DB snapshots plus the source snapshot. A full arms x stats materialization
+   is O(copies) x multi-GB and will exhaust the volume.
 
-3. **Identity scope.** The grouped `(id, count)` / `(gk, maxdc, n)` identity digest
-   is presentation-independent -- run it ONCE per (literal × user × stat state),
-   NEVER per-`LIMIT`/N. Compute each shipped-baseline identity ONCE and reuse it
-   across all candidates (the baseline output is identical for every candidate).
+3. **Identity scope.** Compare every projected result column, or use the
+   family's explicit grouped `(id, count)` / `(gk, maxdc, n)` identity digest
+   when presentation independence is the contract. Run identity once per
+   (derived cell x user x stat state), never per timing iteration. Compute a
+   shipped baseline once and reuse it across candidates when the baseline SQL
+   and bound values are identical. A declared divergence stays narrow: retain
+   the full identity gate, count the accepted and invalid differences, and run
+   a synthetic fixture that proves the exception fires.
 
 4. **Warm the cache.** Pre-warm every copy (`cat db db-wal db-shm >/dev/null`)
    before its timing block; a cold first read of a multi-GB DB dominates and mimics
@@ -349,6 +357,11 @@ hand-roll a harness that omits any of them.
    Validate rewrite firing AND identity against the RAW `trace_stmt` form, NOT
    `sql_expanded` -- a rewrite can pass on inlined SQL yet `capture_miss` live where
    the app binds that slot.
+
+   Retain provenance headers. A materializer may skip leading blank lines and
+   `--` comments, but its first executable line must start with `SELECT` or
+   `WITH`. It must still reject `CREATE TEMP` / `CREATE TABLE` wrappers before
+   execution.
 
    **Live-docker-log RAW-prepare validation technique (Emby/Plex instrumented instance):**
 
@@ -376,6 +389,11 @@ hand-roll a harness that omits any of them.
       appear for the `?`-form shape but not for the
       inlined shape, the matcher pattern must be adjusted to match raw `zSql`.
 
+   Parameters that are present in the production raw form stay as parameters in
+   identity, EQP, warm-up, and timed SQL and receive genuine CLI/API binds before
+   prepare. Do not substitute a sample literal to obtain a STAT4 plan for an
+   unknown-at-prepare parameter.
+
    **On-Deck raw-shape rule:** The matcher accepts an inlined decimal or a
    positional `?`/`?N` for both `library_section_id` and `account_id`. The
    id-list and literal-threshold selectors share the base On-Deck gate. After
@@ -386,9 +404,17 @@ hand-roll a harness that omits any of them.
    `capture_miss/selector`. The
    raw-vs-`sql_expanded` distinction above applies to every new matcher.
 
-6. **Clean up.** Delete the whole host scratch subdir at the end, INCLUDING on
-   kill/abort. If you deliberately keep the source copy for a re-run, delete
-   everything else and say so.
+6. **Clean up.** Delete the whole per-run host scratch subdirectory at the end,
+   INCLUDING on HUP/INT/TERM/abort. Signal handlers exit with a nonzero
+   128-plus-signal status and route cleanup through the EXIT trap. When durable
+   structured outputs are requested, preserve them after successful and failed
+   runs; delete the copied database and every sidecar before exit and keep only
+   the run-local output files. Never keep or delete the configured source.
+
+7. **Probe optional planner-stat tables safely.** Check `sqlite_schema` before
+   selecting from `sqlite_stat1` or `sqlite_stat4`. Select row counts only for
+   tables that exist and record absent tables as non-fatal state. The pre-ANALYZE
+   probe must run on databases where `ANALYZE` has never created either table.
 
 ## Harness Methodology
 

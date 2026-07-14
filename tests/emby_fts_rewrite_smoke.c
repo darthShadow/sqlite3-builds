@@ -98,8 +98,7 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
-    const char *target,
-    const char *mode,
+    obs_rewrite_mode mode,
     obs_miss_reason reason,
     const char *sub_reason,
     sqlite3 *db,
@@ -107,7 +106,6 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
     size_t len,
     uint64_t shape
 ) {
-    (void)target;
     (void)mode;
     (void)reason;
     (void)sub_reason;
@@ -119,30 +117,36 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_index_missing(
     sqlite3 *db,
-    const char *target,
-    const char *mode
+    obs_rewrite_mode mode
 ) {
     (void)db;
-    (void)target;
     (void)mode;
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
-    const char *target,
-    const char *mode,
+    obs_rewrite_mode mode,
     sqlite3 *db,
     const char *source,
     size_t source_len,
     const char *rewritten,
     size_t rewritten_len
 ) {
-    (void)target;
     (void)mode;
     (void)db;
     (void)source;
     (void)source_len;
     (void)rewritten;
     (void)rewritten_len;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_skipped(
+    sqlite3 *db,
+    const char *reason,
+    obs_rewrite_mode mode
+) {
+    (void)db;
+    (void)reason;
+    (void)mode;
 }
 #endif
 
@@ -196,6 +200,8 @@ static void failf(const char *fmt, ...) {
     fflush(stderr);
     exit(1);
 }
+
+#include "contract_parity.h"
 
 static char *xasprintf(const char *fmt, ...) {
     va_list ap;
@@ -843,7 +849,7 @@ static char *make_movies_latest_expected_projection(
         "AND NOT EXISTS (      SELECT 1 "
         "      FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_movies_puk_dc_cover "
         "      WHERE B.Type = 5 AND B.PresentationUniqueKey IS A.PresentationUniqueKey "
-        "AND ( (B.DateCreated IS NULL AND A.DateCreated IS NOT NULL) OR B.DateCreated < A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) "
+        "AND ( (B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated > A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) "
         "AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (%s) ) "
         "AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = %s AND UB.played <> 0 ) ) "
         "ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, A.PresentationUniqueKey ASC LIMIT %s ) "
@@ -923,6 +929,33 @@ static sqlite3_stmt *prepare_entry(sqlite3 *db, const char *label, const char *s
         failf("FAIL [%s]: prepare entry=%d rc=%d err=%s", label, entry, rc, sqlite3_errmsg(db));
     }
     return stmt;
+}
+
+static sqlite3_stmt *contract_prepare_v2(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char **tail
+) {
+    return prepare_entry(db, label, sql, -1, 2, tail);
+}
+
+static void bind_search_term(
+    sqlite3_stmt *stmt,
+    const char *side,
+    const char *label,
+    void *ctx
+) {
+    const char *search_term = (const char *)ctx;
+    int index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
+    int rc;
+    if (index == 0) {
+        failf("FAIL [%s/%s-bind-index]: @SearchTerm missing", label, side);
+    }
+    rc = sqlite3_bind_text(stmt, index, search_term, -1, SQLITE_STATIC);
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s/%s-bind]: rc=%d", label, side, rc);
+    }
 }
 
 static void expect_sql(sqlite3 *db, const char *label, const char *sql, int nbyte,
@@ -1150,14 +1183,20 @@ static void expect_fixture(sqlite3 *db, const char *name) {
     free(expected);
 }
 
-static void collect_ids(sqlite3 *db, const char *label, const char *sql, int nbyte,
-                        int want_rewrite, const char *search_term, char *out, size_t out_n) {
+static unsigned int collect_fts_id_mask(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    int nbyte,
+    int want_rewrite,
+    const char *search_term
+) {
     const char *tail = NULL;
     sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, 2, &tail);
     int index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
     int rc;
     int rows = 0;
-    size_t used = 0;
+    unsigned int mask = 0;
 
     if (tail != sql + strlen(sql)) {
         failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
@@ -1172,23 +1211,100 @@ static void collect_ids(sqlite3 *db, const char *label, const char *sql, int nby
     require_int("row-parity/bind",
                 sqlite3_bind_text(stmt, index, search_term, -1, SQLITE_STATIC),
                 SQLITE_OK);
-    if (out_n == 0) failf("FAIL [%s]: output buffer empty", label);
-    out[0] = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int n;
-        int id = sqlite3_column_int(stmt, 2);
-        n = snprintf(out + used, out_n - used, "%d,", id);
-        if (n < 0 || (size_t)n >= out_n - used) {
-            failf("FAIL [%s]: row-id buffer too small", label);
+        sqlite3_int64 id = sqlite3_column_int64(stmt, 2);
+        unsigned int bit;
+        if (sqlite3_column_type(stmt, 2) != SQLITE_INTEGER || id < 1 || id > 5) {
+            failf("FAIL [%s/id]: type=%d got=%lld want=1..5", label,
+                  sqlite3_column_type(stmt, 2), (long long)id);
         }
-        used += (size_t)n;
+        bit = 1u << (unsigned int)(id - 1);
+        if ((mask & bit) != 0) {
+            failf("FAIL [%s/duplicate]: id=%lld mask=0x%x", label,
+                  (long long)id, mask);
+        }
+        mask |= bit;
         rows++;
     }
     if (rc != SQLITE_DONE) {
         failf("FAIL [%s/step]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
     }
-    if (rows == 0) failf("FAIL [%s]: expected rows", label);
+    require_int(label, rows, 5);
     require_int("row-parity/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+    return mask;
+}
+
+static int accept_emby_fts_legal_difference(
+    const char *label,
+    int row,
+    sqlite3_stmt *vendor,
+    sqlite3_stmt *candidate,
+    void *ctx
+) {
+    sqlite3_int64 vendor_id;
+    sqlite3_int64 candidate_id;
+
+    (void)label;
+    (void)row;
+    (void)ctx;
+    if (sqlite3_column_type(vendor, 2) != SQLITE_INTEGER ||
+        sqlite3_column_type(candidate, 2) != SQLITE_INTEGER) {
+        return 0;
+    }
+    vendor_id = sqlite3_column_int64(vendor, 2);
+    candidate_id = sqlite3_column_int64(candidate, 2);
+    return vendor_id >= 1 && vendor_id <= 5 &&
+        candidate_id >= 1 && candidate_id <= 5;
+}
+
+static void require_emby_fts_ordered_contract(
+    sqlite3 *vendor_db,
+    sqlite3 *candidate_db,
+    const char *label,
+    const char *vendor_sql,
+    const char *candidate_sql,
+    const char *search_term
+) {
+    char *ordered_vendor_sql = xasprintf("SELECT * FROM (%s) ORDER BY 3", vendor_sql);
+    char *ordered_candidate_sql = xasprintf("SELECT * FROM (%s) ORDER BY 3", candidate_sql);
+    sqlite3_stmt *vendor = NULL;
+    sqlite3_stmt *candidate = NULL;
+    int row;
+    int columns;
+
+    require_int(label, sqlite3_prepare_v2(
+        vendor_db, ordered_vendor_sql, -1, &vendor, NULL
+    ), SQLITE_OK);
+    require_int(label, sqlite3_prepare_v2(
+        candidate_db, ordered_candidate_sql, -1, &candidate, NULL
+    ), SQLITE_OK);
+    columns = sqlite3_column_count(vendor);
+    require_int(label, sqlite3_column_count(candidate), columns);
+    bind_search_term(vendor, "vendor-ordered", label, (void *)search_term);
+    bind_search_term(candidate, "candidate-ordered", label, (void *)search_term);
+    for (row = 0; row < 5; row++) {
+        int col;
+        require_int(label, sqlite3_step(vendor), SQLITE_ROW);
+        require_int(label, sqlite3_step(candidate), SQLITE_ROW);
+        require_int(label, sqlite3_column_int(vendor, 2), row + 1);
+        require_int(label, sqlite3_column_int(candidate, 2), row + 1);
+        for (col = 0; col < columns; col++) {
+            if (!contract_parity_cell_equal(vendor, candidate, col)) {
+                failf("FAIL [%s/ordered-row-%d-column-%d]: vendor_type=%d "
+                      "candidate_type=%d vendor_bytes=%d candidate_bytes=%d",
+                      label, row, col, sqlite3_column_type(vendor, col),
+                      sqlite3_column_type(candidate, col),
+                      sqlite3_column_bytes(vendor, col),
+                      sqlite3_column_bytes(candidate, col));
+            }
+        }
+    }
+    require_int(label, sqlite3_step(vendor), SQLITE_DONE);
+    require_int(label, sqlite3_step(candidate), SQLITE_DONE);
+    require_int(label, sqlite3_finalize(vendor), SQLITE_OK);
+    require_int(label, sqlite3_finalize(candidate), SQLITE_OK);
+    free(ordered_vendor_sql);
+    free(ordered_candidate_sql);
 }
 
 static void collect_first_ints(sqlite3 *db, const char *label, const char *sql,
@@ -1377,53 +1493,182 @@ static void require_ordered_full_row_identity(const char *label,
     }
 }
 
-static void require_column_metadata_identity(
-    sqlite3 *vendor_db,
-    sqlite3 *candidate_db,
-    const char *label,
-    const char *vendor_sql,
-    const char *candidate_source,
-    const char *candidate_sql
-) {
-    const char *vendor_tail = NULL;
-    const char *candidate_tail = NULL;
-    sqlite3_stmt *vendor = prepare_entry(
-        vendor_db, label, vendor_sql, -1, 2, &vendor_tail
-    );
-    sqlite3_stmt *candidate = prepare_entry(
-        candidate_db, label, candidate_source, -1, 2, &candidate_tail
-    );
-    int columns = sqlite3_column_count(vendor);
-    int i;
+typedef struct movies_latest_contract {
+    sqlite3 *vendor_db;
+    sqlite3 *candidate_db;
+    const char *projection;
+} movies_latest_contract;
 
-    require_str_eq(label, sqlite3_sql(vendor), vendor_sql);
-    require_str_eq(label, sqlite3_sql(candidate), candidate_sql);
-    require_int(label, sqlite3_column_count(candidate), columns);
-    if (vendor_tail != vendor_sql + strlen(vendor_sql) ||
-        candidate_tail != candidate_source + strlen(candidate_source)) {
-        failf("FAIL [%s/tail]: vendor=%ld/%ld candidate=%ld/%ld", label,
-              (long)(vendor_tail - vendor_sql), (long)strlen(vendor_sql),
-              (long)(candidate_tail - candidate_source),
-              (long)strlen(candidate_source));
+static void require_movies_latest_fixture_row(
+    const char *label,
+    const char *side,
+    sqlite3 *db,
+    sqlite3_stmt *actual,
+    const char *projection,
+    sqlite3_int64 id
+) {
+    char *sql = xasprintf(
+        "SELECT %sFROM MediaItems AS A LEFT JOIN UserDatas "
+        "ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 "
+        "WHERE A.Id = ?",
+        projection
+    );
+    sqlite3_stmt *expected = NULL;
+    int columns;
+    int col;
+    int rc;
+
+    rc = sqlite3_prepare_v2(db, sql, -1, &expected, NULL);
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s/%s-fixture-prepare]: id=%lld rc=%d err=%s", label,
+              side, (long long)id, rc, sqlite3_errmsg(db));
     }
-    for (i = 0; i < columns; i++) {
-        const char *vendor_name = sqlite3_column_name(vendor, i);
-        const char *candidate_name = sqlite3_column_name(candidate, i);
-        const char *vendor_type = sqlite3_column_decltype(vendor, i);
-        const char *candidate_type = sqlite3_column_decltype(candidate, i);
-        if (!vendor_name || !candidate_name || strcmp(vendor_name, candidate_name) != 0 ||
-            ((vendor_type || candidate_type) &&
-             (!vendor_type || !candidate_type || strcmp(vendor_type, candidate_type) != 0))) {
-            failf("FAIL [%s/column-%d]: vendor_name=%s candidate_name=%s "
-                  "vendor_type=%s candidate_type=%s", label, i,
-                  vendor_name ? vendor_name : "(null)",
-                  candidate_name ? candidate_name : "(null)",
-                  vendor_type ? vendor_type : "(null)",
-                  candidate_type ? candidate_type : "(null)");
+    require_int(label, sqlite3_bind_int64(expected, 1, id), SQLITE_OK);
+    rc = sqlite3_step(expected);
+    if (rc != SQLITE_ROW) {
+        failf("FAIL [%s/%s-fixture-row]: id=%lld rc=%d want=%d err=%s", label,
+              side, (long long)id, rc, SQLITE_ROW, sqlite3_errmsg(db));
+    }
+    columns = sqlite3_column_count(actual);
+    if (sqlite3_column_count(expected) != columns) {
+        failf("FAIL [%s/%s-fixture-columns]: id=%lld actual=%d expected=%d",
+              label, side, (long long)id, columns, sqlite3_column_count(expected));
+    }
+    for (col = 0; col < columns; col++) {
+        if (!contract_parity_cell_equal(actual, expected, col)) {
+            failf("FAIL [%s/%s-fixture-column-%d]: id=%lld actual_type=%d "
+                  "expected_type=%d actual_bytes=%d expected_bytes=%d",
+                  label, side, col, (long long)id,
+                  sqlite3_column_type(actual, col), sqlite3_column_type(expected, col),
+                  sqlite3_column_bytes(actual, col), sqlite3_column_bytes(expected, col));
         }
     }
-    require_int("metadata/vendor-finalize", sqlite3_finalize(vendor), SQLITE_OK);
-    require_int("metadata/candidate-finalize", sqlite3_finalize(candidate), SQLITE_OK);
+    require_int(label, sqlite3_step(expected), SQLITE_DONE);
+    require_int(label, sqlite3_finalize(expected), SQLITE_OK);
+    free(sql);
+}
+
+static unsigned int movies_latest_vendor_group_bit(sqlite3_int64 id) {
+    if (id >= 9301 && id <= 9303) return 1u;
+    if (id >= 9311 && id <= 9312) return 2u;
+    if (id >= 9321 && id <= 9322) return 4u;
+    return 0;
+}
+
+static int accept_movies_latest_legal_difference(
+    const char *label,
+    int row,
+    sqlite3_stmt *vendor,
+    sqlite3_stmt *candidate,
+    void *ctx
+) {
+    static const sqlite3_int64 candidate_ids[] = {9303, 9312, 9321};
+    movies_latest_contract *contract = (movies_latest_contract *)ctx;
+    sqlite3_int64 vendor_id;
+    sqlite3_int64 candidate_id;
+
+    if (row < 0 || row >= (int)(sizeof(candidate_ids) / sizeof(candidate_ids[0])) ||
+        sqlite3_column_type(vendor, 0) != SQLITE_INTEGER ||
+        sqlite3_column_type(candidate, 0) != SQLITE_INTEGER) {
+        return 0;
+    }
+    vendor_id = sqlite3_column_int64(vendor, 0);
+    candidate_id = sqlite3_column_int64(candidate, 0);
+    if (movies_latest_vendor_group_bit(vendor_id) == 0 ||
+        candidate_id != candidate_ids[row]) {
+        return 0;
+    }
+    require_movies_latest_fixture_row(
+        label, "vendor", contract->vendor_db, vendor,
+        contract->projection, vendor_id
+    );
+    require_movies_latest_fixture_row(
+        label, "candidate", contract->candidate_db, candidate,
+        contract->projection, candidate_id
+    );
+    return 1;
+}
+
+static void require_movies_latest_vendor_rows(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char *projection
+) {
+    const char *tail = NULL;
+    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
+    unsigned int group_mask = 0;
+    int rows = 0;
+    int rc;
+
+    require_str_eq(label, sqlite3_sql(stmt), sql);
+    if (tail != sql + strlen(sql)) {
+        failf("FAIL [%s/vendor-tail]: got=%ld want=%ld", label,
+              (long)(tail - sql), (long)strlen(sql));
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        sqlite3_int64 id = sqlite3_column_int64(stmt, 0);
+        unsigned int bit;
+        if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER ||
+            (bit = movies_latest_vendor_group_bit(id)) == 0) {
+            failf("FAIL [%s/vendor-id]: type=%d got=%lld", label,
+                  sqlite3_column_type(stmt, 0), (long long)id);
+        }
+        if ((group_mask & bit) != 0) {
+            failf("FAIL [%s/vendor-duplicate-group]: id=%lld mask=0x%x bit=0x%x",
+                  label, (long long)id, group_mask, bit);
+        }
+        require_movies_latest_fixture_row(
+            label, "vendor", db, stmt, projection, id
+        );
+        group_mask |= bit;
+        rows++;
+    }
+    if (rc != SQLITE_DONE) {
+        failf("FAIL [%s/vendor-step]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
+    }
+    require_int(label, rows, 3);
+    require_int(label, (int)group_mask, 7);
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void require_movies_latest_candidate_rows(
+    sqlite3 *db,
+    const char *label,
+    const char *source_sql,
+    const char *expected_sql,
+    const char *projection,
+    const sqlite3_int64 *expected_ids,
+    int expected_count
+) {
+    const char *tail = NULL;
+    sqlite3_stmt *stmt = prepare_entry(db, label, source_sql, -1, 2, &tail);
+    int row;
+
+    require_str_eq(label, sqlite3_sql(stmt), expected_sql);
+    if (tail != source_sql + strlen(source_sql)) {
+        failf("FAIL [%s/tail]: got=%ld want=%ld", label,
+              (long)(tail - source_sql), (long)strlen(source_sql));
+    }
+    for (row = 0; row < expected_count; row++) {
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            failf("FAIL [%s/row-%d]: rc=%d want=%d err=%s", label, row, rc,
+                  SQLITE_ROW, sqlite3_errmsg(db));
+        }
+        if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER ||
+            sqlite3_column_int64(stmt, 0) != expected_ids[row]) {
+            failf("FAIL [%s/id-row-%d]: type=%d got=%lld want_type=%d want=%lld",
+                  label, row, sqlite3_column_type(stmt, 0),
+                  (long long)sqlite3_column_int64(stmt, 0), SQLITE_INTEGER,
+                  (long long)expected_ids[row]);
+        }
+        require_movies_latest_fixture_row(
+            label, "candidate", db, stmt, projection, expected_ids[row]
+        );
+    }
+    require_int(label, sqlite3_step(stmt), SQLITE_DONE);
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
 static void require_typed_rows_differ(const char *label,
@@ -1472,7 +1717,7 @@ static int child_positive(void) {
     char *numbered_expected;
     char *presentation_expected;
 
-    configure_env(NULL, NULL, NULL);
+    configure_env(NULL, "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     type_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
@@ -1543,7 +1788,7 @@ static int child_direct_test_api(void) {
     sqlite3 *db;
     char *type_sql;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     type_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
@@ -1595,7 +1840,7 @@ static int child_direct_fail_open_family(int movies) {
     int baseline_n = 0;
     sqlite3_stmt *bs;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(db);
@@ -1691,7 +1936,7 @@ static int child_fts_env(const char *value, const char *label, int want_rewrite)
     char *sql;
     char *expected;
 
-    configure_env(value, NULL, NULL);
+    configure_env(value, "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     sql = make_emby_sql(0, "100", "100", "6", "7", 1);
@@ -1713,7 +1958,7 @@ static int child_path_negative(void) {
     char *sql;
     size_t i;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     sql = make_emby_sql(0, "100", "100", "6", "7", 1);
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -1796,7 +2041,7 @@ static int child_nonmatch(void) {
     sqlite3_stmt *stmt = NULL;
     int rc;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     sql = make_emby_sql(0, "100", "100", "6", "7", 1);
@@ -1913,28 +2158,52 @@ static int child_row_parity(void) {
     sqlite3 *original_db;
     sqlite3 *rewritten_db;
     char *sql;
-    char original_ids[128];
-    char rewritten_ids[128];
+    char *expected;
+    unsigned int original_mask;
+    unsigned int rewritten_mask;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     original_db = open_seeded_temp("not-target.db");
     rewritten_db = open_seeded_temp("library.db");
     sql = make_emby_sql(1, "100", "100", "6", "7", 1);
+    expected = make_expected_sql(1, "100", "100", "6", "7", 1);
 
-    collect_ids(original_db, "row-parity-original", sql, -1, 0, "(\"alpha\"*)",
-                original_ids, sizeof(original_ids));
-    collect_ids(rewritten_db, "row-parity-rewritten", sql, (int)strlen(sql) + 1, 1,
-                "(\"alpha\"*)", rewritten_ids, sizeof(rewritten_ids));
-    require_str_eq("row-parity/ids", rewritten_ids, original_ids);
-    require_str_eq("row-parity/expected-arms", rewritten_ids, "1,2,3,4,5,");
-    collect_ids(original_db, "row-parity-or-original", sql, -1, 0,
-                "(\"alpha\"*) OR (\"alpha\"*)", original_ids, sizeof(original_ids));
-    collect_ids(rewritten_db, "row-parity-or-rewritten", sql, (int)strlen(sql) + 1, 1,
-                "(\"alpha\"*) OR (\"alpha\"*)", rewritten_ids, sizeof(rewritten_ids));
-    require_str_eq("row-parity-or/ids", rewritten_ids, original_ids);
-    require_str_eq("row-parity-or/expected-arms", rewritten_ids, "1,2,3,4,5,");
+    contract_parity_require(
+        original_db, rewritten_db, contract_prepare_v2, "emby-fts-contract",
+        sql, sql, expected, bind_search_term, (void *)"(\"alpha\"*)",
+        accept_emby_fts_legal_difference, NULL
+    );
 
+    original_mask = collect_fts_id_mask(
+        original_db, "row-parity-original", sql, -1, 0, "(\"alpha\"*)"
+    );
+    rewritten_mask = collect_fts_id_mask(
+        rewritten_db, "row-parity-rewritten", sql, (int)strlen(sql) + 1, 1,
+        "(\"alpha\"*)"
+    );
+    require_int("row-parity/original-membership", (int)original_mask, 0x1f);
+    require_int("row-parity/candidate-membership", (int)rewritten_mask, 0x1f);
+    require_emby_fts_ordered_contract(
+        original_db, rewritten_db, "row-parity/ordered-contract", sql, expected,
+        "(\"alpha\"*)"
+    );
+    original_mask = collect_fts_id_mask(
+        original_db, "row-parity-or-original", sql, -1, 0,
+        "(\"alpha\"*) OR (\"alpha\"*)"
+    );
+    rewritten_mask = collect_fts_id_mask(
+        rewritten_db, "row-parity-or-rewritten", sql,
+        (int)strlen(sql) + 1, 1, "(\"alpha\"*) OR (\"alpha\"*)"
+    );
+    require_int("row-parity-or/original-membership", (int)original_mask, 0x1f);
+    require_int("row-parity-or/candidate-membership", (int)rewritten_mask, 0x1f);
+    require_emby_fts_ordered_contract(
+        original_db, rewritten_db, "row-parity-or/ordered-contract", sql, expected,
+        "(\"alpha\"*) OR (\"alpha\"*)"
+    );
+
+    free(expected);
     free(sql);
     require_int("row-parity/original-close", sqlite3_close(original_db), SQLITE_OK);
     require_int("row-parity/rewrite-close", sqlite3_close(rewritten_db), SQLITE_OK);
@@ -1960,6 +2229,11 @@ static int child_resume_d_row_parity(void) {
     sql = make_resume_sql();
     expected = make_resume_expected(sql, "100", "1");
 
+    contract_parity_require(
+        original_db, rewritten_db, contract_prepare_v2, "emby-fanout-contract",
+        sql, sql, expected, NULL, NULL, NULL, NULL
+    );
+
     collect_int_column(original_db, "resume-d-row-original", sql, sql, -1, 2,
                        original_ids, sizeof(original_ids));
     collect_int_column(rewritten_db, "resume-d-row-rewritten", sql, expected,
@@ -1976,33 +2250,38 @@ static int child_resume_d_row_parity(void) {
     return 0;
 }
 
-static int child_fanout_default_off(void) {
+static int child_fanout_env(
+    const char *value,
+    const char *label,
+    int env_enables_rewrite
+) {
     sqlite3 *db;
     char *browse_sql;
+    char *browse_one;
+    char *browse_two;
+    char *browse_repl;
+    char *browse_expected;
 
-    configure_env("1", NULL, NULL);
+    configure_env("1", value, "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     browse_sql = make_browse_sql();
-    expect_sql(db, "fanout-default-off", browse_sql, -1, 2, browse_sql, 0);
+    browse_one = make_exists_links_one("100", "6");
+    browse_two = make_exists_links_two("100", "7");
+    browse_repl = xasprintf("(%s OR %s)", browse_one, browse_two);
+    browse_expected = replace_once(
+        browse_sql, "A.Id in WithItemLinkItemIds", browse_repl
+    );
+    expect_sql(
+        db, label, browse_sql, -1, 2,
+        env_enables_rewrite ? browse_expected : browse_sql, 0
+    );
+    free(browse_expected);
+    free(browse_repl);
+    free(browse_two);
+    free(browse_one);
     free(browse_sql);
-    require_int("fanout-default-off/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [fanout-default-off]\n");
-    return 0;
-}
-
-static int child_fanout_off_value(const char *value, const char *label) {
-    sqlite3 *db;
-    char *browse_sql;
-
-    configure_env("1", value, NULL);
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    browse_sql = make_browse_sql();
-    expect_sql(db, label, browse_sql, -1, 2, browse_sql, 0);
-    free(browse_sql);
-    require_int("fanout-off-value/close", sqlite3_close(db), SQLITE_OK);
+    require_int("fanout-env/close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
     printf("PASS [%s]\n", label);
     return 0;
@@ -2352,7 +2631,7 @@ static int child_dashboard_off_value(const char *value, const char *label) {
     char *latest_sql;
     char *movies_sql;
 
-    configure_env("1", NULL, value);
+    configure_env("1", "1", value);
     make_temp_dir();
     db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(db);
@@ -2373,7 +2652,7 @@ static int child_dashboard_default_off(void) {
     char *latest_sql;
     char *movies_sql;
 
-    configure_env("1", NULL, NULL);
+    configure_env("1", "1", NULL);
     make_temp_dir();
     db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(db);
@@ -2405,7 +2684,7 @@ static int child_dashboard_matrix(void) {
     typed_rows candidate_rows;
     int i;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(db);
@@ -2460,7 +2739,7 @@ static int child_dashboard_matrix(void) {
     require_int("dashboard/index-close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 1, 1);
     seed_movies_latest_rows(db);
@@ -2589,6 +2868,55 @@ static const char TEST_MOVIES_MISSING_INDEX[] =
 #undef TEST_MOVIES_FROM
 #undef TEST_MOVIES_TAIL
 
+static void expect_movies_latest_semantics(sqlite3 *db) {
+    static const char *keys[] = {
+        "contract-decorrelated", "contract-mixed-null", "contract-all-null"
+    };
+    static const sqlite3_int64 dates[] = {300, 250, 0};
+    char *sql = make_movies_latest_sql_form(
+        1, "302", 0, "A.PresentationUniqueKey,A.DateCreated ", "42", "12"
+    );
+    sqlite3_stmt *stmt = prepare_entry(db, "movies-latest-semantics", sql, -1, 2, NULL);
+    const char *saved_sql = sqlite3_sql(stmt);
+    int row;
+
+    if (!saved_sql || strcmp(saved_sql, sql) == 0) {
+        failf("FAIL [movies-latest-semantics/rewrite-fired]: candidate SQL did not change");
+    }
+    require_int("movies-latest-semantics/columns", sqlite3_column_count(stmt), 2);
+    require_int("movies-latest-semantics/binds", sqlite3_bind_parameter_count(stmt), 0);
+    for (row = 0; row < 3; row++) {
+        const unsigned char *key;
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW) {
+            failf("FAIL [movies-latest-semantics/row-%d]: rc=%d want=%d err=%s",
+                  row, rc, SQLITE_ROW, sqlite3_errmsg(db));
+        }
+        key = sqlite3_column_text(stmt, 0);
+        if (sqlite3_column_type(stmt, 0) != SQLITE_TEXT || !key ||
+            strcmp((const char *)key, keys[row]) != 0) {
+            failf("FAIL [movies-latest-semantics/key-%d]: type=%d got=%s want=%s",
+                  row, sqlite3_column_type(stmt, 0),
+                  key ? (const char *)key : "(null)", keys[row]);
+        }
+        if (row == 2) {
+            if (sqlite3_column_type(stmt, 1) != SQLITE_NULL) {
+                failf("FAIL [movies-latest-semantics/date-%d]: type=%d want=%d",
+                      row, sqlite3_column_type(stmt, 1), SQLITE_NULL);
+            }
+        } else if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER ||
+                   sqlite3_column_int64(stmt, 1) != dates[row]) {
+            failf("FAIL [movies-latest-semantics/date-%d]: type=%d got=%lld "
+                  "want_type=%d want=%lld", row, sqlite3_column_type(stmt, 1),
+                  (long long)sqlite3_column_int64(stmt, 1), SQLITE_INTEGER,
+                  (long long)dates[row]);
+        }
+    }
+    require_int("movies-latest-semantics/done", sqlite3_step(stmt), SQLITE_DONE);
+    require_int("movies-latest-semantics/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+    free(sql);
+}
+
 static int child_dashboard_fix_b_c(void) {
     static const char *wide_ancestors[] = {"100", "100,200"};
     static const char *compact_ancestors[] = {
@@ -2599,12 +2927,42 @@ static int child_dashboard_fix_b_c(void) {
     sqlite3 *missing_index_db;
     size_t i;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     vendor_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0);
     candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(vendor_db);
     seed_movies_latest_rows(candidate_db);
+    expect_movies_latest_semantics(candidate_db);
+
+    {
+        static const sqlite3_int64 candidate_ids[] = {9303, 9312, 9321};
+        movies_latest_contract contract = {
+            vendor_db,
+            candidate_db,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
+        };
+        char *raw = make_movies_latest_sql(1, "302", "42", "12");
+        char *expected = make_movies_latest_expected("302", "42", "12");
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-representative-contract",
+            raw, raw, expected, NULL, NULL,
+            accept_movies_latest_legal_difference, &contract
+        );
+        require_movies_latest_vendor_rows(
+            vendor_db, "emby-dashboard-movies-vendor-contract", raw,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
+        );
+        require_movies_latest_candidate_rows(
+            candidate_db, "emby-dashboard-movies-candidate-contract", raw,
+            expected, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, candidate_ids,
+            (int)(sizeof(candidate_ids) / sizeof(candidate_ids[0]))
+        );
+        free(raw);
+        free(expected);
+    }
 
     for (i = 0; i < sizeof(wide_ancestors) / sizeof(wide_ancestors[0]); i++) {
         char label[64];
@@ -2617,19 +2975,13 @@ static int child_dashboard_fix_b_c(void) {
         char *outer_select = xasprintf(
             " ) SELECT %sFROM ranked AS R", EMBY_MOVIES_LATEST_WIDE_PROJECTION
         );
-        typed_rows vendor;
-        typed_rows candidate;
         snprintf(label, sizeof(label), "dashboard-movies-wide-m%lu", (unsigned long)i + 3);
         require_contains(label, expected, outer_select);
         expect_sql(candidate_db, label, raw, -1, 2, expected, 0);
-        require_column_metadata_identity(
-            vendor_db, candidate_db, label, raw, raw, expected
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2, label,
+            raw, raw, expected, NULL, NULL, NULL, NULL
         );
-        vendor = collect_typed_rows(vendor_db, label, raw, raw);
-        candidate = collect_typed_rows(candidate_db, label, raw, expected);
-        require_ordered_full_row_identity(label, &vendor, &candidate);
-        free_typed_rows(&vendor);
-        free_typed_rows(&candidate);
         free(raw);
         free(expected);
         free(outer_select);
@@ -2655,20 +3007,12 @@ static int child_dashboard_fix_b_c(void) {
         char *expected = make_latest_expected_form(
             EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
         );
-        typed_rows vendor;
-        typed_rows candidate;
         expect_sql(candidate_db, "dashboard-episodes-e2-scalar", scalar, -1, 2, expected, 0);
-        require_column_metadata_identity(
-            vendor_db, candidate_db, "dashboard-episodes-e2-metadata",
-            oracle, scalar, expected
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-episodes-contract", oracle, scalar, expected,
+            NULL, NULL, NULL, NULL
         );
-        vendor = collect_typed_rows(vendor_db, "dashboard-episodes-e2-oracle", oracle, oracle);
-        candidate = collect_typed_rows(
-            candidate_db, "dashboard-episodes-e2-candidate", scalar, expected
-        );
-        require_ordered_full_row_identity("dashboard-episodes-e2-parity", &vendor, &candidate);
-        free_typed_rows(&vendor);
-        free_typed_rows(&candidate);
         free(oracle);
         free(scalar);
         free(expected);
@@ -2680,16 +3024,12 @@ static int child_dashboard_fix_b_c(void) {
             1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
         );
         char *expected = make_movies_latest_expected("100", "42", "12");
-        typed_rows vendor;
-        typed_rows candidate;
         expect_sql(candidate_db, "dashboard-movies-m7-scalar", scalar, -1, 2, expected, 0);
-        vendor = collect_typed_rows(vendor_db, "dashboard-movies-m7-oracle", oracle, oracle);
-        candidate = collect_typed_rows(
-            candidate_db, "dashboard-movies-m7-candidate", scalar, expected
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-singleton-contract", oracle, scalar, expected,
+            NULL, NULL, NULL, NULL
         );
-        require_ordered_full_row_identity("dashboard-movies-m7-parity", &vendor, &candidate);
-        free_typed_rows(&vendor);
-        free_typed_rows(&candidate);
         free(oracle);
         free(scalar);
         free(expected);
@@ -2773,6 +3113,17 @@ static void seed_movies_latest_rows(sqlite3 *db) {
         "INSERT INTO UserDatas(UserDataKeyId,UserId,IsFavorite,Played,PlaybackPositionTicks,AudioStreamIndex,SubtitleStreamIndex) "
         "SELECT UserDataKeyId,42,(Id%1000)%2,((Id%1000)%5=0),Id*10,(Id%1000)%3,(Id%1000)%4 "
         "FROM MediaItems WHERE Id BETWEEN 5001 AND 5030 OR Id BETWEEN 6001 AND 6024;"
+        "INSERT INTO MediaItems(Id,Type,Name,Path,ProductionYear,RunTimeTicks,ParentId,Images,DateCreated,PresentationUniqueKey,UserDataKeyId) VALUES"
+        "(9301,5,'contract-middle-id','/contract/9301',2031,9301,1,'i9301',200,'contract-decorrelated',19301),"
+        "(9302,5,'contract-oldest','/contract/9302',2032,9302,1,'i9302',100,'contract-decorrelated',19302),"
+        "(9303,5,'contract-newest','/contract/9303',2033,9303,1,'i9303',300,'contract-decorrelated',19303),"
+        "(9311,5,'contract-null','/contract/9311',2034,9311,1,'i9311',NULL,'contract-mixed-null',19311),"
+        "(9312,5,'contract-mixed-newest','/contract/9312',2035,9312,1,'i9312',250,'contract-mixed-null',19312),"
+        "(9321,5,'contract-all-null-a','/contract/9321',2036,9321,1,'i9321',NULL,'contract-all-null',19321),"
+        "(9322,5,'contract-all-null-b','/contract/9322',2037,9322,1,'i9322',NULL,'contract-all-null',19322);"
+        "INSERT INTO AncestorIds2 SELECT Id,302,0 FROM MediaItems WHERE Id BETWEEN 9301 AND 9322;"
+        "INSERT INTO UserDatas(UserDataKeyId,UserId,IsFavorite,Played,PlaybackPositionTicks,AudioStreamIndex,SubtitleStreamIndex) "
+        "SELECT UserDataKeyId,42,0,0,0,0,0 FROM MediaItems WHERE Id BETWEEN 9301 AND 9322;"
     );
 }
 
@@ -2783,11 +3134,11 @@ static void seed_movies_latest_expanded_rows(sqlite3 *db) {
         "SELECT 9000+i,5,'boundary-'||i,'/expanded/'||i,2000+i,900000+i,9900+i,'boundary-img-'||i,10000-i,'boundary-'||i,10000+i FROM n;"
         "INSERT INTO MediaItems(Id,Type,Name,Path,ProductionYear,RunTimeTicks,ParentId,Images,DateCreated,PresentationUniqueKey,UserDataKeyId) VALUES"
         "(9101,5,'singleton','/e/9101',2001,9101,'',NULL,900,'p-single',11101),"
-        "(9102,5,'dup-min','/e/9102',2002,9102,1,'i9102',700,'p-dup',11102),"
-        "(9103,5,'dup-max','/e/9103',2003,9103,1,'i9103',800,'p-dup',11103),"
+        "(9102,5,'dup-middle-id','/e/9102',2002,9102,1,'i9102',800,'p-dup',11102),"
+        "(9103,5,'dup-oldest','/e/9103',2003,9103,1,'i9103',600,'p-dup',11103),"
         "(9104,5,'equal-min-id','/e/9104',2004,9104,1,'i9104',600,'p-equal',11104),"
         "(9105,5,'equal-other','/e/9105',2005,9105,1,'i9105',600,'p-equal',11105),"
-        "(9106,5,'mixed-min','',NULL,9106,1,NULL,300,'p-mixed',11106),"
+        "(9106,5,'mixed-null','',NULL,9106,1,NULL,NULL,'p-mixed',11106),"
         "(9107,5,'mixed-value','/e/9107',2007,9107,1,'i9107',500,'p-mixed',11107),"
         "(9108,5,'all-null-min','/e/9108',2008,9108,1,'i9108',NULL,'p-all-null',11108),"
         "(9109,5,'all-null-other','/e/9109',2009,9109,1,'i9109',NULL,'p-all-null',11109),"
@@ -2799,7 +3150,8 @@ static void seed_movies_latest_expanded_rows(sqlite3 *db) {
         "(9115,5,'xb-invisible-min','/e/9115',2015,9115,1,'i9115',100,'p-xb',11115),"
         "(9116,5,'xb-visible-next','/e/9116',2016,9116,1,'i9116',200,'p-xb',11116),"
         "(9117,5,'ub-played-min','/e/9117',2017,9117,1,'i9117',110,'p-ub',11117),"
-        "(9118,5,'ub-unplayed-next','/e/9118',2018,9118,1,'i9118',210,'p-ub',11118);"
+        "(9118,5,'ub-unplayed-next','/e/9118',2018,9118,1,'i9118',210,'p-ub',11118),"
+        "(9119,5,'dup-newest','/e/9119',2019,9119,1,'i9119',900,'p-dup',11119);"
         "INSERT INTO AncestorIds2 SELECT Id,300,0 FROM MediaItems WHERE Type=5 AND Id>=9001 AND Id<>9115;"
         "INSERT INTO AncestorIds2 VALUES(9115,999,0);"
         "INSERT INTO UserDatas(UserDataKeyId,UserId,IsFavorite,Played,PlaybackPositionTicks,AudioStreamIndex,SubtitleStreamIndex) "
@@ -2839,7 +3191,7 @@ static int child_dashboard_release_matrix(void) {
     int passthrough = 0;
     int ai, ui, li, stat;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     require_str_eq("matrix/hot-literal", ancestors[0], "100");
     require_str_eq("matrix/typical-literal", ancestors[1], "200");
     require_str_eq("matrix/empty-literal", ancestors[2], "999");
@@ -2953,6 +3305,11 @@ static int child_dashboard_release_matrix(void) {
     require_int("matrix/no-guard-cells", passthrough, 36);
 
     for (stat = 0; stat < 2; stat++) {
+        /* C2 selects max DateCreated, then lower Id, and owns this exact order. */
+        static const sqlite3_int64 expected_candidate_ids[] = {
+            9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010,
+            9119, 9101, 9104, 9107, 9111, 9112, 9113, 9118, 9116, 9108
+        };
         sqlite3 *vendor_db;
         sqlite3 *candidate_db;
         char *raw;
@@ -2974,7 +3331,11 @@ static int child_dashboard_release_matrix(void) {
         candidate = collect_typed_rows(candidate_db, "expanded/candidate", raw, expected);
         require_int("expanded/vendor-row-count", vendor.rows, 20);
         require_int("expanded/candidate-row-count", candidate.rows, 20);
-        require_ordered_full_row_identity("expanded/identity", &vendor, &candidate);
+        require_movies_latest_candidate_rows(
+            candidate_db, "expanded/candidate-contract", raw, expected,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION, expected_candidate_ids,
+            (int)(sizeof(expected_candidate_ids) / sizeof(expected_candidate_ids[0]))
+        );
         free_typed_rows(&vendor);
         free_typed_rows(&candidate);
         free(raw);
@@ -3006,7 +3367,7 @@ static int child_latest_limit20(void) {
     char *latest_sql;
     char *latest_expected;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_latest_index("library.db", 1);
     latest_sql = make_latest_sql("A.Id ", "20");
@@ -3027,7 +3388,7 @@ static int child_latest_limit20(void) {
 static int child_latest_fixture_passthrough(const char *name) {
     sqlite3 *db;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_latest_index("library.db", 1);
     expect_fixture(db, name);
@@ -3041,7 +3402,7 @@ static int child_latest_resume_no_misfire(void) {
     sqlite3 *db;
     char *resume_sql;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     make_temp_dir();
     db = open_seeded_temp_with_latest_index("library.db", 1);
     resume_sql = make_resume_sql();
@@ -3592,7 +3953,7 @@ static int child_observability_master_disabled(void) {
     char *latest_miss_sql;
     int saved_stderr_fd;
 
-    configure_env("1", NULL, "0");
+    configure_env("1", "1", "0");
     if (setenv("SQLITE3_DISABLE_STMT_TRACE", "0", 1) != 0) {
         failf("setenv STMT trace failed");
     }
@@ -3624,7 +3985,7 @@ static int child_collision(void) {
     sqlite3 *db;
     char *sql;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     g_collision_scalar_calls = 0;
@@ -3648,7 +4009,7 @@ static int child_authorizer_and_ownership(void) {
     char *sql;
     char *expected;
 
-    configure_env("0", NULL, NULL);
+    configure_env("0", "1", "1");
     make_temp_dir();
     db = open_seeded_temp("library.db");
     sql = make_emby_sql(0, "100", "100", "6", "7", 1);
@@ -3726,9 +4087,10 @@ static void run_child(const char *name) {
         if (strcmp(name, "fixture-canary") == 0) _exit(child_fixture_canary());
         if (strcmp(name, "row-parity") == 0) _exit(child_row_parity());
         if (strcmp(name, "resume-d-row-parity") == 0) _exit(child_resume_d_row_parity());
-        if (strcmp(name, "fanout-default-off") == 0) _exit(child_fanout_default_off());
-        if (strcmp(name, "fanout-one-off") == 0) _exit(child_fanout_off_value("1", "fanout-one-off"));
-        if (strcmp(name, "fanout-garbage-off") == 0) _exit(child_fanout_off_value("false", "fanout-garbage-off"));
+        if (strcmp(name, "fanout-default-on") == 0) _exit(child_fanout_env(NULL, "fanout-default-on", 1));
+        if (strcmp(name, "fanout-zero-enables") == 0) _exit(child_fanout_env("0", "fanout-zero-enables", 1));
+        if (strcmp(name, "fanout-one-disables") == 0) _exit(child_fanout_env("1", "fanout-one-disables", 0));
+        if (strcmp(name, "fanout-garbage-enables") == 0) _exit(child_fanout_env("false", "fanout-garbage-enables", 1));
         if (strcmp(name, "fanout-matrix") == 0) _exit(child_fanout_matrix());
         if (strcmp(name, "emby-slow-search-matrix") == 0) _exit(child_emby_slow_search_matrix());
         if (strcmp(name, "dashboard-default-off") == 0) _exit(child_dashboard_default_off());
@@ -3783,9 +4145,10 @@ int main(int argc, char **argv) {
     run_child("fixture-canary");
     run_child("row-parity");
     run_child("resume-d-row-parity");
-    run_child("fanout-default-off");
-    run_child("fanout-one-off");
-    run_child("fanout-garbage-off");
+    run_child("fanout-default-on");
+    run_child("fanout-zero-enables");
+    run_child("fanout-one-disables");
+    run_child("fanout-garbage-enables");
     run_child("fanout-matrix");
     run_child("emby-slow-search-matrix");
     run_child("dashboard-default-off");

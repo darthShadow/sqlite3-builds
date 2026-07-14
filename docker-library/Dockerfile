@@ -110,6 +110,7 @@ COPY src/runtime_optimize.c /app/runtime_optimize.c
 COPY src/auto_extension_internal.h /app/auto_extension_internal.h
 COPY src/observability.c /app/observability.c
 COPY src/observability.h /app/observability.h
+COPY src/rewrite_modes.h /app/rewrite_modes.h
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
 COPY src/fts_lex.c /app/fts_lex.c
 COPY src/fts_lex.h /app/fts_lex.h
@@ -121,7 +122,6 @@ COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
 COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
 COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
 COPY build/libsqlite3-version-script.ld /app/build/libsqlite3-version-script.ld
-COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
 
@@ -198,6 +198,9 @@ RUN if [ "$LIBRARY_VARIANT" = "generic" ]; then \
         exit 1; \
       fi; \
     fi
+
+# WHY: Copy tests last so a test-only change reuses the cached amalgamation build and ICU-verify layers.
+COPY tests/ /app/tests/
 
 # WHY: Smoke links use LDFLAGS_VARIANT while runtime lookup uses LD_LIBRARY_PATH.
 RUN set -euo pipefail; \

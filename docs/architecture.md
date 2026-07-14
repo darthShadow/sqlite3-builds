@@ -45,12 +45,13 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `src/auto_extension_internal.h` | Shared internal seam header between `src/auto_extension.c` and `src/runtime_optimize.c`. |
 | `src/observability.c` | Built into both library variants; owns SQLite wrappers, observability state, record formatting, and prepare-chain entry points. |
 | `src/observability.h` | Private cross-translation-unit seam for shared observability functions. |
+| `src/rewrite_modes.h` | Compile-time catalogue for signed rewrite-mode identity, wire display metadata, positional logger labels, and index-missing eligibility. |
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `src/fts_lex.c` | Built into both library variants; owns the shared FTS rewrite SQL token scanner. |
 | `src/fts_lex.h` | Private shared lexer header consumed by the Plex and Emby FTS rewrite wrappers. |
-| `src/plex_fts_rewrite.c` | Built into both library variants; owns the Plex FTS prefix-tag rewrite plus opt-in taggings-membership and On-Deck id-list/threshold rewrites. |
+| `src/plex_fts_rewrite.c` | Built into both library variants; owns the Plex FTS prefix-tag rewrite, opt-in GUID-LIKE NULL guard, default-on taggings-membership rewrite, and opt-in On-Deck id-list/threshold rewrites. |
 | `src/plex_fts_rewrite.h` | Private prepare-wrapper seam header between the Emby helper and Plex rewrite helper. |
-| `src/emby_fts_rewrite.c` | Built into both library variants; owns the Emby FTS scalar rewrite plus opt-in fan-out and dashboard Latest rewrites. |
+| `src/emby_fts_rewrite.c` | Built into both library variants; owns the default-on Emby FTS scalar and fan-out rewrites plus opt-in dashboard Latest rewrites. |
 | `src/emby_fts_rewrite.h` | Private prepare-wrapper seam header between `src/observability.c` and `src/emby_fts_rewrite.c`. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
 | `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline runtime optimize target gating, STAT1/STAT4 refresh, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
@@ -59,15 +60,16 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/plex_fts_rewrite_smoke.c` | Runtime smoke for Plex FTS, taggings-membership, both On-Deck selectors, observability sampling/dedup, env/index gates, fail-open paths, and row parity. |
+| `tests/plex_fts_rewrite_smoke.c` | Runtime smoke for Plex FTS, GUID-LIKE, taggings-membership, both On-Deck selectors, observability sampling/dedup, env/index gates, fail-open paths, and row parity. |
 | `tests/emby_fts_rewrite_smoke.c` | Runtime smoke and direct canary for Emby FTS, fan-out, dashboard projection/scalar forms, observability sampling/dedup, fail-open gates, fixtures, and row parity. |
 | `tests/emby_fts_rewrite_prepare_bench.c` | Advisory prepare-cost bench for default-on-select, enabled-nontarget-select, enabled-emby-miss, enabled-emby-large-miss, enabled-all-large-miss, enabled-emby-match, and enabled-emby-exec-miss Emby rewrite paths. |
 | `tests/fixtures/emby-fts-rewrite/` | Raw Emby search statement fixtures and expected prepare-wrapper output for smoke and manual host-gate checks. |
+| `tests/fixtures/plex-fts-rewrite/` | Raw Plex On-Deck statement fixtures and expected prepare-wrapper output for smoke checks. |
 | `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: schema v3 metadata, detector, artifact, pre, Plex pool-site, unsupported rows, and malformed-input rejection. |
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
 | `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for the `preflight` / `build-cli` / `build-generic` / `build-plex` job split and producer-owned smokes, minimal release assets, rendered release-notes wiring, and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
-| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults and SORTERREF/PMASZ compile/runtime alignment, enforces six `Load version pins` steps, and enforces workflow concurrency, the GHCR registry build-cache contract (`type=gha` forbidden; `CACHE_EXPORT_ENABLED`-gated event-ref-only exports), and all 18 project `COPY` lines after the ICU and mimalloc dependency layers. |
+| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults and SORTERREF/PMASZ compile/runtime alignment, enforces the 14-row mode catalogue, four-mode index eligibility, exact producer map, escaped raw-literal rejection, runbook-row and ABI-staging contracts, six `Load version pins` steps, workflow concurrency, the GHCR registry build-cache contract (`type=gha` forbidden; `CACHE_EXPORT_ENABLED`-gated event-ref-only exports), and all 19 project `COPY` lines after the ICU and mimalloc dependency layers. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled and run in library images without failing the build. |
 | `tests/runtime_optimize_close_bench.c` | Advisory runtime optimize hook microbench for close-adjacent inline exits, compiled and run for the generic library variant on every build without failing the build. |
 | `build/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
@@ -130,7 +132,7 @@ Everything else is shared: the SQLite amalgamation pin, `src/auto_extension.c`,
 `src/runtime_optimize.c`, `src/observability.c`, `src/slow_query_tracker.c`,
 `src/fts_lex.c`, `src/plex_fts_rewrite.c`, `src/emby_fts_rewrite.c`, seam
 headers `src/auto_extension_internal.h`, `src/fts_lex.h`,
-`src/observability.h`, `src/plex_fts_rewrite.h`, and
+`src/observability.h`, `src/rewrite_modes.h`, `src/plex_fts_rewrite.h`, and
 `src/emby_fts_rewrite.h`, feature families,
 tuning defaults, high-capacity limits, shared-cache omission, and page-cache
 overflow stat posture.
@@ -245,8 +247,8 @@ Observability:
 - Trace registration failure must log and continue; it must never fail
   `sqlite3_open*`.
 - `obs_logf` must emit each bounded record with one `fwrite()` under the stderr
-  stream lock. Missing-index logs are once per connection/mode; index probe
-  errors are not deduplicated.
+  stream lock. Missing-index logs use process-global per-mode first/every-1024th
+  sampling; index probe errors are not deduplicated.
 - Observability log emission is independent of target filtering, read-only
   filtering, and `SQLITE3_DISABLE_AUTOPRAGMA`.
 - The observability kill switch must remain literal

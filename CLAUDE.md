@@ -42,17 +42,26 @@ Project-specific guidance:
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
   `tests/check_pin_alignment.sh`; keep the `docker-library/Dockerfile` ICU and
-  mimalloc dependency layers above all 18 project `COPY` lines; keep the
+  mimalloc dependency layers above all 19 project `COPY` lines; keep the
   `.github/workflows/sqlite-build.yml` GHCR `type=registry` cache contract
   (import the event ref and then the baseline ref; export the event ref only,
   gated on `CACHE_EXPORT_ENABLED` and `continue-on-error: true`; forbid
   `type=gha`) aligned with the hardcoded counts in
-  `tests/check_pin_alignment.sh` (18 project `COPY` lines, 6 `Load version pins`
+  `tests/check_pin_alignment.sh` (19 project `COPY` lines, 6 `Load version pins`
   steps, each of 3 cache scopes appearing twice, 3 baseline refs, and 6 event
   refs); keep the literal semantics for
   `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` and
   `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` aligned across their `src/*.c` owners,
   `docs/env-vars.md`, this file, and `tests/check_pin_alignment.sh`.
+- Keep `src/rewrite_modes.h` as the only rewrite-mode catalogue. Producers pass
+  exact signed `OBS_MODE_*` ids. Each catalogue row owns target, wire mode,
+  positional logger label, and index-missing eligibility metadata; all mode
+  counter extents use `OBS_MODE_COUNT`. Applied counters remain per connection;
+  miss and index-missing counters remain process-global. Only Plex taggings,
+  Plex On-Deck, Emby Episodes Latest, and Emby movies Latest are index-missing
+  eligible. Invalid ids suppress the requested record and can emit at most one
+  process-wide `obs_mode_unregistered` diagnostic while observability is
+  enabled.
 - Keep runtime optimize opt-in: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0`
   enables; unset, literal `1`, and every other value disable. Keep maintenance
   defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
@@ -62,10 +71,18 @@ Project-specific guidance:
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
-  Keep Plex taggings/On-Deck rewrites opt-in:
-  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` (taggings-membership) and
-  `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` (On-Deck) each enable on literal `0`;
-  unset, literal `1`, and every other value disable. Both fail open and are
+  Keep Plex GUID-LIKE and On-Deck rewrites opt-in.
+  `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` (GUID LIKE NULL guard) enables on
+  literal `0`; unset, literal `1`, and every other value disable. It fails open
+  and is independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+  Keep Plex taggings rewrite opt-out (default-on in the Plex/ICU build): literal
+  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=1` disables; unset, literal `0`, and
+  every other value enable. It fails open and is independent of
+  `SQLITE3_DISABLE_AUTOPRAGMA` and `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+  Keep Plex On-Deck rewrite semantics exact:
+  `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` (On-Deck) enables on literal `0`;
+  unset, literal `1`, and every other value disable. It fails open and is
   independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE`. The Plex On-Deck `viewed_at > <literal>`
   arm runs whenever `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enables the base
@@ -85,14 +102,14 @@ Project-specific guidance:
   increases output. This sampling knob never enables STMT trace by itself.
   Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-out (default-on
   in the Emby build): literal `1` disables; unset, literal `0`, and every other
-  value enable. Keep the two Emby membership/dashboard knobs opt-in:
-  `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` (Browse-by-name / Favorites-first / RES-A /
-  People-Studios-Type-29) and `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE`
-  (Episodes-Latest and movies-Latest) each enable on literal `0`; unset, literal
-  `1`, and every other value disable. All three are fail-open and independent
-  of `SQLITE3_DISABLE_AUTOPRAGMA`. Advisory: to also optimize the Emby fan-out
-  families, enable `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0`; it is not required
-  and is not code-enforced. Knob naming:
+  value enable. Keep Emby fan-out rewrite
+  (`SQLITE3_DISABLE_EMBY_FANOUT_REWRITE`) opt-out (default-on in the Emby build):
+  literal `1` disables; unset, literal `0`, and every other value enable. Keep
+  the Emby dashboard knob opt-in:
+  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE` (Episodes-Latest and movies-Latest)
+  enables on literal `0`; unset, literal `1`, and every other value disable.
+  All three are fail-open and independent of `SQLITE3_DISABLE_AUTOPRAGMA`.
+  Knob naming:
   `SQLITE3_DISABLE_<ENGINE>_<PURPOSE>_REWRITE`.
 - Do not create or modify `AGENTS.md` here unless explicitly asked; the root
   convention is a symlink to this file.

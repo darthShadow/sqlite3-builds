@@ -20,9 +20,12 @@
 #define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"
 #define PLEX_TAG_MEMBERSHIP_OPEN " AND metadata_items.id IN (SELECT metadata_item_id FROM taggings WHERE tag_id="
 #define PLEX_TAG_MEMBERSHIP_CLOSE ")"
-#define PLEX_MODE_FTS "fts+tag_type"
-#define PLEX_MODE_TAGGINGS "taggings+membership"
-#define PLEX_MODE_ONDECK "ondeck"
+#define PLEX_ONDECK_COLUMN_COUNT 7
+
+static const char PLEX_GUID_LIKE_SQL[] =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2";
+static const char PLEX_GUID_LIKE_REWRITTEN_SQL[] =
+    "SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2";
 
 static const char PLEX_ONDECK_AFTER_IDS[] =
     " and metadata_item_settings.view_count>0  and metadata_item_views.account_id=";
@@ -53,17 +56,6 @@ typedef struct plex_span {
     size_t start;
     size_t end;
 } plex_span;
-
-typedef enum plex_value_slot_kind {
-    PLEX_VALUE_LITERAL = 0,
-    PLEX_VALUE_POSITIONAL = 1
-} plex_value_slot_kind;
-
-typedef struct plex_value_slot {
-    plex_value_slot_kind kind;
-    plex_span span;
-    int assigned_index;
-} plex_value_slot;
 
 typedef enum plex_ondeck_selector_kind {
     PLEX_ONDECK_SELECTOR_IDS = 0,
@@ -122,6 +114,8 @@ typedef struct plex_rewrite_candidate {
     size_t rewrite_len;
     int expected_bind_count;
     int verify_bind_count;
+    int expected_column_count;
+    int verify_column_count;
 } plex_rewrite_candidate;
 
 __attribute__((visibility("hidden"))) SQLITE_API int sqlite3_prepare_real(
@@ -154,12 +148,13 @@ static void plex_log_rewrite_applied(
     size_t source_len,
     const char *rewritten,
     size_t rewritten_len,
-    const char *mode
+    obs_rewrite_mode mode
 );
-static void plex_log_rewrite_skipped(sqlite3 *db, const char *reason, const char *mode);
 
 static pthread_once_t g_plex_rewrite_once = PTHREAD_ONCE_INIT;
 static atomic_int g_plex_rewrite_enabled;
+static pthread_once_t g_plex_guid_like_rewrite_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_guid_like_rewrite_enabled;
 static pthread_once_t g_plex_tag_rewrite_once = PTHREAD_ONCE_INIT;
 static atomic_int g_plex_tag_rewrite_enabled;
 static pthread_once_t g_plex_ondeck_rewrite_once = PTHREAD_ONCE_INIT;
@@ -179,11 +174,27 @@ static int plex_rewrite_enabled(void) {
     return atomic_load_explicit(&g_plex_rewrite_enabled, memory_order_acquire);
 }
 
+static void plex_guid_like_rewrite_init_once(void) {
+    const char *value = getenv("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE");
+    atomic_store_explicit(
+        &g_plex_guid_like_rewrite_enabled,
+        (value && strcmp(value, "0") == 0) ? 1 : 0,
+        memory_order_release
+    );
+}
+
+static int plex_guid_like_rewrite_enabled(void) {
+    pthread_once(&g_plex_guid_like_rewrite_once, plex_guid_like_rewrite_init_once);
+    return atomic_load_explicit(
+        &g_plex_guid_like_rewrite_enabled, memory_order_acquire
+    );
+}
+
 static void plex_tag_rewrite_init_once(void) {
     const char *value = getenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE");
     atomic_store_explicit(
         &g_plex_tag_rewrite_enabled,
-        (value && strcmp(value, "0") == 0) ? 1 : 0,
+        (value && strcmp(value, "1") == 0) ? 0 : 1,
         memory_order_release
     );
 }
@@ -990,10 +1001,10 @@ static plex_match_result match_tag_membership_query(
         index_state = plex_tag_index_ready(db);
         if (index_state != PLEX_INDEX_PRESENT) {
             if (index_state == PLEX_INDEX_MISSING) {
-                obs_log_index_missing(db, "plex", PLEX_MODE_TAGGINGS);
+                obs_log_index_missing(db, OBS_MODE_PLEX_TAGGINGS);
             } else {
-                plex_log_rewrite_skipped(
-                    db, "index_probe_error", PLEX_MODE_TAGGINGS
+                obs_log_rewrite_skipped(
+                    db, "index_probe_error", OBS_MODE_PLEX_TAGGINGS
                 );
             }
             return PLEX_MATCH_MISS;
@@ -1028,12 +1039,11 @@ static int plex_parse_ondeck_value_at(
     size_t pos,
     int variable_limit,
     int *max_index,
-    plex_value_slot *slot,
+    plex_span *slot,
     size_t *after
 ) {
     fts_lex lx;
     fts_lex_token tok;
-    int assigned_index;
     size_t i;
 
     if (pos > len) return 0;
@@ -1042,11 +1052,9 @@ static int plex_parse_ondeck_value_at(
     tok = fts_lex_next_token(&lx);
     if (tok.start != pos) return 0;
     if (tok.type == FTS_LEX_TOK_NUMBER) {
-        slot->kind = PLEX_VALUE_LITERAL;
-        slot->span.start = tok.start;
-        slot->span.end = tok.end;
-        slot->assigned_index = 0;
-        if (!plex_validate_integer_span(sql, &slot->span)) return 0;
+        slot->start = tok.start;
+        slot->end = tok.end;
+        if (!plex_validate_integer_span(sql, slot)) return 0;
         *after = tok.end;
         return 1;
     }
@@ -1054,7 +1062,7 @@ static int plex_parse_ondeck_value_at(
     if (sql[tok.start] != '?') return 0;
     if (tok.end == tok.start + 1) {
         if (*max_index == INT_MAX || *max_index >= variable_limit) return 0;
-        assigned_index = ++*max_index;
+        (*max_index)++;
     } else {
         int value = 0;
 
@@ -1067,14 +1075,11 @@ static int plex_parse_ondeck_value_at(
             value = value * 10 + digit;
         }
         if (value > variable_limit) return 0;
-        assigned_index = value;
-        if (assigned_index > *max_index) *max_index = assigned_index;
+        if (value > *max_index) *max_index = value;
     }
 
-    slot->kind = PLEX_VALUE_POSITIONAL;
-    slot->span.start = tok.start;
-    slot->span.end = tok.end;
-    slot->assigned_index = assigned_index;
+    slot->start = tok.start;
+    slot->end = tok.end;
     *after = tok.end;
     return 1;
 }
@@ -1090,7 +1095,7 @@ static void plex_log_ondeck_miss(
 
     if (!obs_is_disabled()) shape = fts_lex_shape_key(sql, scan_len);
     obs_log_rewrite_miss(
-        "plex", PLEX_MODE_ONDECK, reason, sub_reason,
+        OBS_MODE_PLEX_ONDECK, reason, sub_reason,
         db, sql, scan_len, shape
     );
 }
@@ -1102,7 +1107,7 @@ static int plex_ondeck_is_per_guid_variant(
     int variable_limit
 ) {
     static const char guid_open[] = " and grandparents.guid='";
-    plex_value_slot account_id;
+    plex_span account_id;
     int max_index = 0;
     size_t guid_start;
 
@@ -1129,35 +1134,6 @@ static int plex_ondeck_is_per_guid_variant(
         return 0;
     }
     return plex_trailing_space_only(sql, scan_len, pos);
-}
-
-static size_t plex_positional_render_len(int assigned_index) {
-    size_t len = 2;
-    while (assigned_index >= 10) {
-        len++;
-        assigned_index /= 10;
-    }
-    return len;
-}
-
-static void plex_append_value_slot(
-    char **p,
-    const char *sql,
-    const plex_value_slot *slot
-) {
-    if (slot->kind == PLEX_VALUE_LITERAL) {
-        plex_append_span(p, sql, &slot->span);
-    } else {
-        char digits[16];
-        size_t count = 0;
-        int n = slot->assigned_index;
-        *(*p)++ = '?';
-        do {
-            digits[count++] = (char)('0' + n % 10);
-            n /= 10;
-        } while (n > 0);
-        while (count > 0) *(*p)++ = digits[--count];
-    }
 }
 
 static int plex_parse_integer_list_at(
@@ -1219,9 +1195,9 @@ static int plex_parse_ondeck_threshold_at(
 static char *plex_build_ondeck_sql(
     sqlite3 *db,
     const char *sql,
-    const plex_value_slot *section_id,
+    const plex_span *section_id,
     const plex_ondeck_selector *selector,
-    const plex_value_slot *account_id,
+    const plex_span *account_id,
     size_t *rewrite_len
 ) {
     static const char tpl0[] =
@@ -1229,7 +1205,7 @@ static char *plex_build_ondeck_sql(
         "       originally_available_at AS originally_available_at,\n"
         "       parent_index AS parent_index,\n"
         "       metadata_item_views_index AS \"index\",\n"
-        "       viewed_at AS \"max(viewed_at)\",\n"
+        "       +viewed_at AS \"max(viewed_at)\",\n"
         "       library_section_id AS library_section_id,\n"
         "       grandparents_extra_data AS extra_data\n"
         "FROM (\n"
@@ -1240,9 +1216,13 @@ static char *plex_build_ondeck_sql(
         "         metadata_item_views.viewed_at AS viewed_at,\n"
         "         grandparents.library_section_id AS library_section_id,\n"
         "         grandparentsSettings.extra_data AS grandparents_extra_data,\n"
+        /* SQLite leaves bare columns undefined when max(viewed_at) ties. The final
+           keys choose one representative deterministically; any different values,
+           including NULL originally_available_at, are inherent in the vendor tie.
+           Keep it non-NULL-hardened: the consumer must tolerate vendor results. */
         "         row_number() OVER (PARTITION BY grandparents.id ORDER BY metadata_item_views.viewed_at DESC, metadata_item_views.id DESC, grandparentsSettings.id DESC, metadata_item_settings.id DESC) AS dshadow_on_deck_rank\n"
         "  FROM metadata_items AS grandparents\n"
-        "  CROSS JOIN metadata_item_views\n"
+        "  JOIN metadata_item_views\n"
         "  JOIN metadata_item_settings\n"
         "  JOIN metadata_item_settings AS grandparentsSettings\n"
         "  WHERE grandparents.guid=metadata_item_views.grandparent_guid\n"
@@ -1279,12 +1259,8 @@ static char *plex_build_ondeck_sql(
     size_t selector_close_len;
     const plex_span *selector_value;
 
-    section_len = section_id->kind == PLEX_VALUE_LITERAL
-        ? section_id->span.end - section_id->span.start
-        : plex_positional_render_len(section_id->assigned_index);
-    account_len = account_id->kind == PLEX_VALUE_LITERAL
-        ? account_id->span.end - account_id->span.start
-        : plex_positional_render_len(account_id->assigned_index);
+    section_len = section_id->end - section_id->start;
+    account_len = account_id->end - account_id->start;
     if (selector->kind == PLEX_ONDECK_SELECTOR_IDS) {
         selector_open = ids_open;
         selector_open_len = sizeof(ids_open) - 1;
@@ -1318,12 +1294,12 @@ static char *plex_build_ondeck_sql(
     if (!rewritten) return NULL;
     p = rewritten;
     plex_append_bytes(&p, tpl0, sizeof(tpl0) - 1);
-    plex_append_value_slot(&p, sql, section_id);
+    plex_append_span(&p, sql, section_id);
     plex_append_bytes(&p, selector_open, selector_open_len);
     plex_append_span(&p, sql, selector_value);
     plex_append_bytes(&p, selector_close, selector_close_len);
     plex_append_bytes(&p, predicate_tail, sizeof(predicate_tail) - 1);
-    plex_append_value_slot(&p, sql, account_id);
+    plex_append_span(&p, sql, account_id);
     plex_append_bytes(&p, tpl3, sizeof(tpl3) - 1);
     rewritten[out_len] = 0;
     *rewrite_len = out_len;
@@ -1341,9 +1317,9 @@ static plex_match_result match_ondeck_query(
     static const char after_section[] = " and grandparents.id in (";
     static const char after_threshold[] = " and viewed_at > ";
     static const char conjunction[] = " and ";
-    plex_value_slot section_id;
+    plex_span section_id;
     plex_ondeck_selector selector;
-    plex_value_slot account_id;
+    plex_span account_id;
     plex_index_state index_state;
     int max_index = 0;
     int variable_limit;
@@ -1453,10 +1429,10 @@ static plex_match_result match_ondeck_query(
     index_state = plex_ondeck_index_ready(db);
     if (index_state != PLEX_INDEX_PRESENT) {
         if (index_state == PLEX_INDEX_MISSING) {
-            obs_log_index_missing(db, "plex", PLEX_MODE_ONDECK);
+            obs_log_index_missing(db, OBS_MODE_PLEX_ONDECK);
         } else {
-            plex_log_rewrite_skipped(
-                db, "index_probe_error", PLEX_MODE_ONDECK
+            obs_log_rewrite_skipped(
+                db, "index_probe_error", OBS_MODE_PLEX_ONDECK
             );
         }
         return PLEX_MATCH_MISS;
@@ -1468,6 +1444,8 @@ static plex_match_result match_ondeck_query(
     candidate->scan_out_len = candidate->rewrite_len;
     candidate->expected_bind_count = max_index;
     candidate->verify_bind_count = 1;
+    candidate->expected_column_count = PLEX_ONDECK_COLUMN_COUNT;
+    candidate->verify_column_count = 1;
     return PLEX_MATCH_BUILT;
 }
 
@@ -1493,6 +1471,43 @@ static int plex_prepare_input_lengths(
         (*scan_len)--;
     }
     return 1;
+}
+
+static plex_match_result match_guid_like_query(
+    const char *sql,
+    size_t bounded_len,
+    size_t scan_len,
+    plex_rewrite_candidate *candidate
+) {
+    const size_t source_len = sizeof(PLEX_GUID_LIKE_SQL) - 1;
+    const size_t rewritten_len = sizeof(PLEX_GUID_LIKE_REWRITTEN_SQL) - 1;
+    size_t suffix_len;
+
+    if (scan_len != source_len ||
+        memcmp(sql, PLEX_GUID_LIKE_SQL, source_len) != 0) {
+        return PLEX_MATCH_MISS;
+    }
+    if (bounded_len < scan_len || bounded_len - scan_len > 1) {
+        return PLEX_MATCH_MISS;
+    }
+
+    suffix_len = bounded_len - scan_len;
+    if (rewritten_len > SIZE_MAX - suffix_len - 1) {
+        return PLEX_MATCH_BUILD_FAILED;
+    }
+    candidate->rewrite_len = rewritten_len + suffix_len;
+    candidate->sql = (char *)malloc(candidate->rewrite_len + 1);
+    if (!candidate->sql) return PLEX_MATCH_BUILD_FAILED;
+
+    memcpy(candidate->sql, PLEX_GUID_LIKE_REWRITTEN_SQL, rewritten_len);
+    memcpy(candidate->sql + rewritten_len, sql + scan_len, suffix_len);
+    candidate->sql[candidate->rewrite_len] = 0;
+    candidate->scan_out_len = rewritten_len;
+    candidate->expected_bind_count = 2;
+    candidate->verify_bind_count = 1;
+    candidate->expected_column_count = 1;
+    candidate->verify_column_count = 1;
+    return PLEX_MATCH_BUILT;
 }
 
 static char *plex_build_rewritten_sql(
@@ -1543,17 +1558,11 @@ static void plex_log_rewrite_applied(
     size_t source_len,
     const char *rewritten,
     size_t rewritten_len,
-    const char *mode
+    obs_rewrite_mode mode
 ) {
     obs_log_rewrite_applied(
-        "plex", mode, db, source, source_len, rewritten, rewritten_len
+        mode, db, source, source_len, rewritten, rewritten_len
     );
-}
-
-static void plex_log_rewrite_skipped(sqlite3 *db, const char *reason, const char *mode) {
-    obs_logf("plex_fts_rewrite",
-             "event=rewrite_skipped target=plex reason=%s mode=%s db=%p",
-             reason, mode, (void*)db);
 }
 
 static int plex_retry_original_after_rewrite_failure(
@@ -1586,7 +1595,9 @@ static int plex_prepare_rewritten_sql(
     size_t rewrite_len,
     int expected_bind_count,
     int verify_bind_count,
-    const char *mode
+    int expected_column_count,
+    int verify_column_count,
+    obs_rewrite_mode mode
 ) {
     int rewrite_nbyte = nByte < 0 ? -1 : (int)rewrite_len;
     const char *rewritten_tail = NULL;
@@ -1598,14 +1609,14 @@ static int plex_prepare_rewritten_sql(
         kind, db, rewritten, rewrite_nbyte, prepFlags, ppStmt, &rewritten_tail
     );
     if (rc != SQLITE_OK) {
-        plex_log_rewrite_skipped(db, "rewritten_prepare_failed", mode);
+        obs_log_rewrite_skipped(db, "rewritten_prepare_failed", mode);
         free(rewritten);
         return plex_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
         );
     }
     if (!plex_map_end_tail(zSql, rewritten, rewritten_tail, scan_len, scan_out_len, &mapped_tail)) {
-        plex_log_rewrite_skipped(db, "tail_mismatch", mode);
+        obs_log_rewrite_skipped(db, "tail_mismatch", mode);
         free(rewritten);
         return plex_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
@@ -1613,7 +1624,15 @@ static int plex_prepare_rewritten_sql(
     }
     if (verify_bind_count &&
         sqlite3_bind_parameter_count(*ppStmt) != expected_bind_count) {
-        plex_log_rewrite_skipped(db, "bind_count_mismatch", mode);
+        obs_log_rewrite_skipped(db, "bind_count_mismatch", mode);
+        free(rewritten);
+        return plex_retry_original_after_rewrite_failure(
+            kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
+        );
+    }
+    if (verify_column_count &&
+        sqlite3_column_count(*ppStmt) != expected_column_count) {
+        obs_log_rewrite_skipped(db, "column_count_mismatch", mode);
         free(rewritten);
         return plex_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
@@ -1646,13 +1665,16 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     const char *raw_fn;
     char *rewritten = NULL;
     int fts_on;
+    int guid_like_on;
     int tag_on;
     int ondeck_on;
 
     fts_on = plex_rewrite_enabled();
+    guid_like_on = plex_guid_like_rewrite_enabled();
     tag_on = plex_tag_rewrite_enabled();
     ondeck_on = plex_ondeck_rewrite_enabled();
-    if ((!fts_on && !tag_on && !ondeck_on) || !db || !zSql || !ppStmt || nByte == 0) {
+    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on) ||
+        !db || !zSql || !ppStmt || nByte == 0) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
 
@@ -1665,10 +1687,29 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
 
+    if (guid_like_on) {
+        memset(&candidate, 0, sizeof(candidate));
+        match_result = match_guid_like_query(zSql, bounded_len, scan_len, &candidate);
+        if (match_result == PLEX_MATCH_BUILT) {
+            return plex_prepare_rewritten_sql(
+                kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
+                candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
+                candidate.expected_bind_count, candidate.verify_bind_count,
+                candidate.expected_column_count, candidate.verify_column_count,
+                OBS_MODE_PLEX_GUID_LIKE
+            );
+        }
+        if (match_result == PLEX_MATCH_BUILD_FAILED) {
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_GUID_LIKE);
+            free(candidate.sql);
+            return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
+        }
+    }
+
     if (fts_on && match_target_prefix_query(&PLEX_FTS_TARGET, zSql, scan_len, &match)) {
         rewritten = plex_build_rewritten_sql(zSql, bounded_len, &match);
         if (!rewritten) {
-            plex_log_rewrite_skipped(db, "build_failed", PLEX_MODE_FTS);
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_FTS);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
         }
         return plex_prepare_rewritten_sql(
@@ -1677,8 +1718,8 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             scan_len,
             scan_len + REWRITE_OPEN_LEN + REWRITE_CLOSE_LEN,
             bounded_len + REWRITE_OPEN_LEN + REWRITE_CLOSE_LEN,
-            0, 0,
-            PLEX_MODE_FTS
+            0, 0, 0, 0,
+            OBS_MODE_PLEX_FTS
         );
     }
 
@@ -1689,12 +1730,12 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             return plex_prepare_rewritten_sql(
                 kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
                 candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
-                0, 0,
-                PLEX_MODE_TAGGINGS
+                0, 0, 0, 0,
+                OBS_MODE_PLEX_TAGGINGS
             );
         }
         if (match_result == PLEX_MATCH_BUILD_FAILED) {
-            plex_log_rewrite_skipped(db, "build_failed", PLEX_MODE_TAGGINGS);
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_TAGGINGS);
             free(candidate.sql);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
         }
@@ -1708,11 +1749,12 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
                 kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
                 candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
                 candidate.expected_bind_count, candidate.verify_bind_count,
-                PLEX_MODE_ONDECK
+                candidate.expected_column_count, candidate.verify_column_count,
+                OBS_MODE_PLEX_ONDECK
             );
         }
         if (match_result == PLEX_MATCH_BUILD_FAILED) {
-            plex_log_rewrite_skipped(db, "build_failed", PLEX_MODE_ONDECK);
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_ONDECK);
             free(candidate.sql);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
         }

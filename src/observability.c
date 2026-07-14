@@ -23,27 +23,29 @@
 #define OBS_CORR_SET_CAP 512u
 #define OBS_CORR_TABLE_CAP 1024u
 #define OBS_MISS_REASON_COUNT 2u
-#define OBS_INDEX_MISSING_MODE_COUNT 4u
 
 #define OBS_CORR_UNAVAILABLE_APPLIED 0x01u
 #define OBS_CORR_UNAVAILABLE_STMT 0x02u
 
-enum obs_applied_mode {
-    OBS_APPLIED_PLEX_FTS = 0,
-    OBS_APPLIED_PLEX_TAGGINGS,
-    OBS_APPLIED_PLEX_ONDECK,
-    OBS_APPLIED_EMBY_FTS,
-    OBS_APPLIED_EMBY_BROWSE,
-    OBS_APPLIED_EMBY_FAVORITES,
-    OBS_APPLIED_EMBY_LINKS_SEARCH,
-    OBS_APPLIED_EMBY_PEOPLE,
-    OBS_APPLIED_EMBY_RESUME,
-    OBS_APPLIED_EMBY_RESUME_SIMPLE,
-    OBS_APPLIED_EMBY_SIMILAR,
-    OBS_APPLIED_EMBY_EPISODES_LATEST,
-    OBS_APPLIED_EMBY_MOVIES_LATEST,
-    OBS_APPLIED_MODE_COUNT
+typedef struct obs_rewrite_mode_metadata {
+    const char *target;
+    const char *mode;
+    const char *fn;
+    unsigned char index_missing_eligible;
+} obs_rewrite_mode_metadata;
+
+static const obs_rewrite_mode_metadata g_obs_rewrite_modes[OBS_MODE_COUNT] = {
+#define OBS_REWRITE_MODE_METADATA(suffix, target, mode, fn, eligible) \
+    [OBS_MODE_##suffix] = { target, mode, fn, eligible },
+    OBS_REWRITE_MODE_CATALOG(OBS_REWRITE_MODE_METADATA)
+#undef OBS_REWRITE_MODE_METADATA
 };
+
+_Static_assert(
+    sizeof(g_obs_rewrite_modes) / sizeof(g_obs_rewrite_modes[0]) ==
+        OBS_MODE_COUNT,
+    "rewrite mode metadata cardinality"
+);
 
 typedef struct obs_corr_set {
     pthread_mutex_t mutex;
@@ -59,7 +61,7 @@ typedef struct obs_corr_state {
 
 typedef struct obs_connection_state {
     atomic_uint corr_unavailable_bits;
-    atomic_uint_fast64_t applied_counts[OBS_APPLIED_MODE_COUNT];
+    atomic_uint_fast64_t applied_counts[OBS_MODE_COUNT];
     atomic_uint_fast64_t stmt_count;
     _Atomic(obs_corr_state *) corr_state;
 } obs_connection_state;
@@ -95,9 +97,10 @@ static obs_corr_set g_miss_shape_set = {
     PTHREAD_MUTEX_INITIALIZER, 0, {0}, {0}
 };
 static atomic_uint_fast64_t
-    g_miss_counts[OBS_MISS_REASON_COUNT][OBS_APPLIED_MODE_COUNT];
+    g_miss_counts[OBS_MISS_REASON_COUNT][OBS_MODE_COUNT];
 static atomic_uint_fast64_t
-    g_index_missing_counts[OBS_INDEX_MISSING_MODE_COUNT];
+    g_index_missing_counts[OBS_MODE_COUNT];
+static atomic_flag g_obs_unregistered_reported = ATOMIC_FLAG_INIT;
 static __thread int s_init_depth = 0;
 
 struct obs_name {
@@ -654,7 +657,7 @@ static obs_connection_state *obs_connection_state_get(sqlite3 *db, int create) {
         return NULL;
     }
     atomic_init(&state->corr_unavailable_bits, 0u);
-    for (i = 0; i < OBS_APPLIED_MODE_COUNT; i++) {
+    for (i = 0; i < OBS_MODE_COUNT; i++) {
         atomic_init(&state->applied_counts[i], 0u);
     }
     atomic_init(&state->stmt_count, 0u);
@@ -811,76 +814,52 @@ static const char *obs_sample_label(
     return NULL;
 }
 
-static int obs_index_missing_slot(const char *target, const char *mode) {
-    if (!target || !mode) return -1;
-    if (strcmp(target, "plex") == 0) {
-        if (strcmp(mode, "taggings+membership") == 0) {
-            return 0;
-        }
-        if (strcmp(mode, "ondeck") == 0) return 1;
-        return -1;
+static const obs_rewrite_mode_metadata *obs_rewrite_mode_lookup(
+    obs_rewrite_mode mode,
+    const char *site
+) {
+    int32_t mode_id = mode;
+
+    if (mode_id > OBS_MODE_NONE && mode_id < OBS_MODE_COUNT) {
+        return &g_obs_rewrite_modes[(size_t)mode_id];
     }
-    if (strcmp(target, "emby") != 0) return -1;
-    if (strcmp(mode, "dashboard+episodes_latest") == 0) {
-        return 2;
+    if (!atomic_flag_test_and_set_explicit(
+            &g_obs_unregistered_reported, memory_order_relaxed
+        )) {
+        obs_logf("observability",
+            "event=obs_mode_unregistered mode_id=%" PRId32 " site=%s",
+            mode_id, site
+        );
     }
-    if (strcmp(mode, "dashboard+movies_latest") == 0) {
-        return 3;
-    }
-    return -1;
+    return NULL;
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_index_missing(
     sqlite3 *db,
-    const char *target,
-    const char *mode
+    obs_rewrite_mode mode
 ) {
+    const obs_rewrite_mode_metadata *metadata;
     uint64_t count;
     const char *sample_label;
-    int slot;
+    size_t mode_index;
 
     if (obs_is_disabled()) return;
-    slot = obs_index_missing_slot(target, mode);
-    if (slot < 0) return;
+    metadata = obs_rewrite_mode_lookup(mode, "index_missing");
+    if (!metadata) return;
+    if (metadata->index_missing_eligible == 0) return;
+    mode_index = (size_t)(int32_t)mode;
     count = atomic_fetch_add_explicit(
-        &g_index_missing_counts[slot], 1u, memory_order_relaxed
+        &g_index_missing_counts[mode_index], 1u, memory_order_relaxed
     ) + 1u;
     sample_label = obs_sample_label(count, OBS_CORR_UNAVAILABLE);
     if (!sample_label) return;
     obs_logf(
-        target && strcmp(target, "plex") == 0
-            ? "plex_fts_rewrite" : "emby_fts_rewrite",
+        metadata->fn,
         "event=rewrite_skipped target=%s reason=index_missing mode=%s "
         "db=%p sample=%s count=%" PRIu64,
-        target ? target : "", mode ? mode : "", (void *)db,
+        metadata->target, metadata->mode, (void *)db,
         sample_label, count
     );
-}
-
-static int obs_applied_mode_index(const char *target, const char *mode) {
-    if (!target || !mode) return -1;
-    if (strcmp(target, "plex") == 0) {
-        if (strcmp(mode, "fts+tag_type") == 0) return OBS_APPLIED_PLEX_FTS;
-        if (strcmp(mode, "taggings+membership") == 0) return OBS_APPLIED_PLEX_TAGGINGS;
-        if (strcmp(mode, "ondeck") == 0) return OBS_APPLIED_PLEX_ONDECK;
-        return -1;
-    }
-    if (strcmp(target, "emby") != 0) return -1;
-    if (strcmp(mode, "fts+membership") == 0) return OBS_APPLIED_EMBY_FTS;
-    if (strcmp(mode, "fanout+browse") == 0) return OBS_APPLIED_EMBY_BROWSE;
-    if (strcmp(mode, "fanout+favorites") == 0) return OBS_APPLIED_EMBY_FAVORITES;
-    if (strcmp(mode, "fanout+links_search") == 0) return OBS_APPLIED_EMBY_LINKS_SEARCH;
-    if (strcmp(mode, "fanout+people") == 0) return OBS_APPLIED_EMBY_PEOPLE;
-    if (strcmp(mode, "fanout+resume") == 0) return OBS_APPLIED_EMBY_RESUME;
-    if (strcmp(mode, "fanout+resume_simple") == 0) return OBS_APPLIED_EMBY_RESUME_SIMPLE;
-    if (strcmp(mode, "fanout+similar") == 0) return OBS_APPLIED_EMBY_SIMILAR;
-    if (strcmp(mode, "dashboard+episodes_latest") == 0) {
-        return OBS_APPLIED_EMBY_EPISODES_LATEST;
-    }
-    if (strcmp(mode, "dashboard+movies_latest") == 0) {
-        return OBS_APPLIED_EMBY_MOVIES_LATEST;
-    }
-    return -1;
 }
 
 static uint64_t obs_mix_string(uint64_t hash, const char *value) {
@@ -895,16 +874,15 @@ static uint64_t obs_mix_string(uint64_t hash, const char *value) {
 
 static uint64_t obs_mix(
     uint64_t shape,
-    const char *target,
+    const obs_rewrite_mode_metadata *metadata,
     const char *reason,
-    const char *mode,
     const char *sub_reason
 ) {
     uint64_t hash = shape;
 
-    hash = obs_mix_string(hash, target);
+    hash = obs_mix_string(hash, metadata->target);
     hash = obs_mix_string(hash, reason);
-    hash = obs_mix_string(hash, mode);
+    hash = obs_mix_string(hash, metadata->mode);
     return obs_mix_string(hash, sub_reason);
 }
 
@@ -915,8 +893,7 @@ static const char *obs_miss_reason_name(obs_miss_reason reason) {
 }
 
 static int obs_log_capture_miss_full(
-    const char *target,
-    const char *mode,
+    const obs_rewrite_mode_metadata *metadata,
     const char *reason,
     const char *sub_reason,
     sqlite3 *db,
@@ -927,8 +904,6 @@ static int obs_log_capture_miss_full(
     uint64_t shape,
     uint64_t corr
 ) {
-    const char *fn = target && strcmp(target, "plex") == 0
-        ? "plex_fts_rewrite" : "emby_fts_rewrite";
     char ts[32];
     char *line;
     size_t escaped_len;
@@ -945,8 +920,8 @@ static int obs_log_capture_miss_full(
         "event=rewrite_skipped target=%s reason=%s mode=%s "
         "sub_reason=%s db=%p sample=%s count=%" PRIu64
         " shape=%016" PRIx64 " sql_len=%zu corr=%016" PRIx64 " sql=\"",
-        ts, (long)getpid(), obs_tid(), fn,
-        target ? target : "", reason, mode ? mode : "",
+        ts, (long)getpid(), obs_tid(), metadata->fn,
+        metadata->target, reason, metadata->mode,
         sub_reason ? sub_reason : "", (void *)db, sample, count, shape, len, corr
     );
     if (rc < 0) return 0;
@@ -964,8 +939,8 @@ static int obs_log_capture_miss_full(
         "event=rewrite_skipped target=%s reason=%s mode=%s "
         "sub_reason=%s db=%p sample=%s count=%" PRIu64
         " shape=%016" PRIx64 " sql_len=%zu corr=%016" PRIx64 " sql=\"",
-        ts, (long)getpid(), obs_tid(), fn,
-        target ? target : "", reason, mode ? mode : "",
+        ts, (long)getpid(), obs_tid(), metadata->fn,
+        metadata->target, reason, metadata->mode,
         sub_reason ? sub_reason : "", (void *)db, sample, count, shape, len, corr
     );
     if (rc < 0 || (size_t)rc != prefix_len) {
@@ -985,8 +960,7 @@ static int obs_log_capture_miss_full(
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
-    const char *target,
-    const char *mode,
+    obs_rewrite_mode mode,
     obs_miss_reason reason,
     const char *sub_reason,
     sqlite3 *db,
@@ -994,6 +968,7 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
     size_t len,
     uint64_t shape
 ) {
+    const obs_rewrite_mode_metadata *metadata;
     char sqlbuf[OBS_SQL_CAP * 4 + sizeof(OBS_TRUNC_TAIL)];
     enum obs_corr_result observed;
     const char *reason_name;
@@ -1001,19 +976,20 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
     uint64_t count;
     uint64_t corr;
     uint64_t key;
-    int mode_index;
+    size_t mode_index;
 
     if (obs_is_disabled()) return;
     reason_name = obs_miss_reason_name(reason);
     if (!reason_name) return;
-    mode_index = obs_applied_mode_index(target, mode);
-    if (mode_index < 0) return;
+    metadata = obs_rewrite_mode_lookup(mode, "rewrite_miss");
+    if (!metadata) return;
+    mode_index = (size_t)(int32_t)mode;
     count = atomic_fetch_add_explicit(
         &g_miss_counts[(unsigned int)reason][mode_index],
         1u,
         memory_order_relaxed
     ) + 1u;
-    key = obs_mix(shape, target, reason_name, mode, sub_reason);
+    key = obs_mix(shape, metadata, reason_name, sub_reason);
     observed = shape != 0u
         ? obs_corr_set_observe(&g_miss_shape_set, key)
         : OBS_CORR_UNAVAILABLE;
@@ -1021,27 +997,25 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
     if (!sample_label) return;
     corr = obs_sql_corr_key(sql, len);
     if (obs_log_capture_miss_full(
-            target, mode, reason_name, sub_reason, db, sql, len,
+            metadata, reason_name, sub_reason, db, sql, len,
             sample_label, count, shape, corr
         )) {
         return;
     }
     obs_escape_sql_bounded(sql, len, sqlbuf, sizeof(sqlbuf), OBS_SQL_CAP);
     obs_logf(
-        target && strcmp(target, "plex") == 0
-            ? "plex_fts_rewrite" : "emby_fts_rewrite",
+        metadata->fn,
         "event=rewrite_skipped target=%s reason=%s mode=%s "
         "sub_reason=%s db=%p sample=%s count=%" PRIu64
         " shape=%016" PRIx64 " sql_len=%zu corr=%016" PRIx64 " sql=\"%s\"",
-        target ? target : "", reason_name, mode ? mode : "",
+        metadata->target, reason_name, metadata->mode,
         sub_reason ? sub_reason : "", (void *)db, sample_label, count, shape,
         len, corr, sqlbuf
     );
 }
 
 static void obs_emit_rewrite_applied(
-    const char *target,
-    const char *mode,
+    const obs_rewrite_mode_metadata *metadata,
     sqlite3 *db,
     const char *sample,
     uint64_t count,
@@ -1056,11 +1030,10 @@ static void obs_emit_rewrite_applied(
             &g_rewrite_applied_sql_disabled, memory_order_acquire
         )) {
         obs_logf(
-            target && strcmp(target, "plex") == 0
-                ? "plex_fts_rewrite" : "emby_fts_rewrite",
+            metadata->fn,
             "event=rewrite_applied target=%s mode=%s db=%p sample=%s "
             "count=%" PRIu64 " source_corr=%016" PRIx64 " corr=%016" PRIx64,
-            target ? target : "", mode ? mode : "", (void *)db, sample,
+            metadata->target, metadata->mode, (void *)db, sample,
             count, source_corr, corr
         );
         return;
@@ -1075,53 +1048,46 @@ static void obs_emit_rewrite_applied(
             rewritten, rewritten_len, sqlbuf, sizeof(sqlbuf), OBS_SQL_CAP
         );
         obs_logf(
-            target && strcmp(target, "plex") == 0
-                ? "plex_fts_rewrite" : "emby_fts_rewrite",
+            metadata->fn,
             "event=rewrite_applied target=%s mode=%s db=%p sample=%s "
             "count=%" PRIu64 " source_corr=%016" PRIx64
             " corr=%016" PRIx64 " source_sql=\"%s\" sql=\"%s\"",
-            target ? target : "", mode ? mode : "", (void *)db, sample,
+            metadata->target, metadata->mode, (void *)db, sample,
             count, source_corr, corr, sourcebuf, sqlbuf
         );
     }
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
-    const char *target,
-    const char *mode,
+    obs_rewrite_mode mode,
     sqlite3 *db,
     const char *source,
     size_t source_len,
     const char *rewritten,
     size_t rewritten_len
 ) {
+    const obs_rewrite_mode_metadata *metadata;
     obs_connection_state *state;
     obs_corr_set *corr_set = NULL;
     enum obs_corr_result corr_result = OBS_CORR_UNAVAILABLE;
-    uint64_t count = 1u;
+    uint64_t count;
     uint64_t source_corr;
     uint64_t corr;
     const char *sample_label;
-    int mode_index;
-    int scheduled = 1;
+    size_t mode_index;
 
     if (obs_is_disabled()) return;
-    mode_index = obs_applied_mode_index(target, mode);
-    state = mode_index >= 0 ? obs_connection_state_get(db, 1) : NULL;
-    if (mode_index >= 0 && !state) return;
-    if (state) {
-        count = atomic_fetch_add_explicit(
-            &state->applied_counts[mode_index], 1u, memory_order_relaxed
-        ) + 1u;
-        sample_label = obs_sample_label(count, OBS_CORR_UNAVAILABLE);
-        scheduled = sample_label != NULL;
-        corr_set = obs_corr_set_for_stream(
-            db, state, OBS_CORR_UNAVAILABLE_APPLIED, 1
-        );
-        if (!scheduled && !corr_set) return;
-    } else {
-        sample_label = obs_sample_label(count, OBS_CORR_UNAVAILABLE);
-    }
+    metadata = obs_rewrite_mode_lookup(mode, "rewrite_applied");
+    if (!metadata) return;
+    mode_index = (size_t)(int32_t)mode;
+    state = obs_connection_state_get(db, 1);
+    if (!state) return;
+    count = atomic_fetch_add_explicit(
+        &state->applied_counts[mode_index], 1u, memory_order_relaxed
+    ) + 1u;
+    corr_set = obs_corr_set_for_stream(
+        db, state, OBS_CORR_UNAVAILABLE_APPLIED, 1
+    );
     corr = obs_sql_corr_key(rewritten, rewritten_len);
     if (corr_set) {
         corr_result = obs_corr_set_observe(corr_set, corr);
@@ -1133,14 +1099,29 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
             );
         }
     }
-    if (!scheduled) {
-        sample_label = obs_sample_label(count, corr_result);
-        if (!sample_label) return;
-    }
+    sample_label = obs_sample_label(count, corr_result);
+    if (!sample_label) return;
     source_corr = obs_sql_corr_key(source, source_len);
     obs_emit_rewrite_applied(
-        target, mode, db, sample_label, count,
+        metadata, db, sample_label, count,
         source, source_len, rewritten, rewritten_len, source_corr, corr
+    );
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_skipped(
+    sqlite3 *db,
+    const char *reason,
+    obs_rewrite_mode mode
+) {
+    const obs_rewrite_mode_metadata *metadata;
+
+    if (obs_is_disabled()) return;
+    metadata = obs_rewrite_mode_lookup(mode, "rewrite_skipped");
+    if (!metadata) return;
+    obs_logf(
+        metadata->fn,
+        "event=rewrite_skipped target=%s reason=%s mode=%s db=%p",
+        metadata->target, reason, metadata->mode, (void *)db
     );
 }
 

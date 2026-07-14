@@ -31,6 +31,7 @@ stage_scratch() {
     "$scratch/tools/lsio-mod" \
     "$scratch/tools" \
     "$scratch/scripts"
+  mkdir -p "$scratch/docs/runbooks/query-measure/families"
 
   cp "$repo_root/tests/check_pin_alignment.sh" "$scratch/tests/check_pin_alignment.sh"
   cp "$repo_root/pins/versions.env" "$scratch/pins/versions.env"
@@ -51,8 +52,18 @@ stage_scratch() {
   cp "$repo_root/docs/env-vars.md" "$scratch/docs/env-vars.md"
   cp "$repo_root/src/auto_extension.c" "$scratch/src/auto_extension.c"
   cp "$repo_root/src/emby_fts_rewrite.c" "$scratch/src/emby_fts_rewrite.c"
+  cp "$repo_root/src/fts_lex.c" "$scratch/src/fts_lex.c"
   cp "$repo_root/src/observability.c" "$scratch/src/observability.c"
+  cp "$repo_root/src/observability.h" "$scratch/src/observability.h"
   cp "$repo_root/src/plex_fts_rewrite.c" "$scratch/src/plex_fts_rewrite.c"
+  cp "$repo_root/src/rewrite_modes.h" "$scratch/src/rewrite_modes.h"
+  cp "$repo_root/src/runtime_optimize.c" "$scratch/src/runtime_optimize.c"
+  cp "$repo_root/src/slow_query_tracker.c" "$scratch/src/slow_query_tracker.c"
+  cp "$repo_root/docs/runbooks/query-measure/families/plex-guid-like.sh" "$scratch/docs/runbooks/query-measure/families/plex-guid-like.sh"
+  cp "$repo_root/docs/runbooks/query-measure/families/emby-fanout.sh" "$scratch/docs/runbooks/query-measure/families/emby-fanout.sh"
+  cp "$repo_root/docs/runbooks/query-measure/families/emby-search.sh" "$scratch/docs/runbooks/query-measure/families/emby-search.sh"
+  cp "$repo_root/docs/runbooks/query-measure/families/emby-dashboard.sh" "$scratch/docs/runbooks/query-measure/families/emby-dashboard.sh"
+  cp "$repo_root/tests/abi_obsolete_config_ops_test.sh" "$scratch/tests/abi_obsolete_config_ops_test.sh"
   cp "$repo_root/tools/ci/mod-bake-smoke.sh" "$scratch/tools/ci/mod-bake-smoke.sh"
   cp "$repo_root/tools/lsio-mod/render-lsio-mod-baked-pins.sh" "$scratch/tools/lsio-mod/render-lsio-mod-baked-pins.sh"
   cp "$repo_root/scripts/optimize_media_servers.sh" "$scratch/scripts/optimize_media_servers.sh"
@@ -344,6 +355,108 @@ text = text[:start] + block.replace(line, "", 1) + text[end:]
 path.write_text(text)
 PY
       ;;
+    rewrite-catalogue-missing-guid)
+      python3 - "$scratch/src/rewrite_modes.h" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+line = '    X(PLEX_GUID_LIKE, "plex", "guid+like-null", "plex_fts_rewrite", 0) \\\n'
+if text.count(line) != 1:
+    raise SystemExit("PLEX_GUID_LIKE catalogue fixture missing")
+path.write_text(text.replace(line, "", 1))
+PY
+      ;;
+    rewrite-catalogue-browse-eligible)
+      python3 - "$scratch/src/rewrite_modes.h" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '    X(EMBY_BROWSE, "emby", "fanout+browse", "emby_fts_rewrite", 0) \\\n'
+new = '    X(EMBY_BROWSE, "emby", "fanout+browse", "emby_fts_rewrite", 1) \\\n'
+if text.count(old) != 1:
+    raise SystemExit("EMBY_BROWSE eligibility fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    rewrite-resume-wrong-valid-token)
+      python3 - "$scratch/src/emby_fts_rewrite.c" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "    candidate->mode = OBS_MODE_EMBY_RESUME;\n"
+new = "    candidate->mode = OBS_MODE_EMBY_FTS;\n"
+if text.count(old) != 1:
+    raise SystemExit("Emby resume producer fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    rewrite-guid-raw-producer)
+      python3 - "$scratch/src/plex_fts_rewrite.c" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "                OBS_MODE_PLEX_GUID_LIKE\n"
+new = '                "guid+like-null"\n'
+if text.count(old) != 1:
+    raise SystemExit("Plex GUID producer fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    rewrite-raw-wire-slow-query)
+      printf '%s\n' 'candidate->mode = "guid+like-null";' >> "$scratch/src/slow_query_tracker.c"
+      ;;
+    rewrite-docker-copy-missing)
+      python3 - "$scratch/docker-library/Dockerfile" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+line = "COPY src/rewrite_modes.h /app/rewrite_modes.h\n"
+if text.count(line) != 1:
+    raise SystemExit("rewrite_modes Docker COPY fixture missing")
+path.write_text(text.replace(line, "", 1))
+PY
+      ;;
+    rewrite-docker-count-restored-18)
+      python3 - "$scratch/tests/check_pin_alignment.sh" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "  19 \\\n  'library dependency layers before all project COPY lines'"
+new = "  18 \\\n  'library dependency layers before all project COPY lines'"
+if text.count(old) != 1:
+    raise SystemExit("19-copy checker fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    rewrite-runbook-row-drift)
+      python3 - "$scratch/docs/runbooks/query-measure/families/emby-search.sh" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "Emby People mode catalogue contract drifted"
+new = "Emby people mode catalogue contract drifted"
+if text.count(old) != 1:
+    raise SystemExit("Emby People runbook row fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    rewrite-abi-observability-header-missing)
+      grep -Fv 'cp "${repo_root}/src/observability.h" "${tmpdir}/observability.h"' \
+        "$scratch/tests/abi_obsolete_config_ops_test.sh" > "$scratch/tests/abi_obsolete_config_ops_test.sh.tmp"
+      mv "$scratch/tests/abi_obsolete_config_ops_test.sh.tmp" "$scratch/tests/abi_obsolete_config_ops_test.sh"
+      ;;
+    rewrite-abi-mode-header-missing)
+      grep -Fv 'cp "${repo_root}/src/rewrite_modes.h" "${tmpdir}/rewrite_modes.h"' \
+        "$scratch/tests/abi_obsolete_config_ops_test.sh" > "$scratch/tests/abi_obsolete_config_ops_test.sh.tmp"
+      mv "$scratch/tests/abi_obsolete_config_ops_test.sh.tmp" "$scratch/tests/abi_obsolete_config_ops_test.sh"
+      ;;
     stmt-sampling-source-literal)
       awk '
         $0 == "        (stmt_sampling && strcmp(stmt_sampling, \"1\") == 0) ? 1 : 0," {
@@ -412,6 +525,26 @@ assert_fails_with cache-export-not-best-effort 'best-effort cache export count d
 assert_fails_with concurrency-tag-cancel-enabled \
   "missing exact line:   cancel-in-progress: \${{ !startsWith(github.ref, 'refs/tags/') }}"
 assert_fails_with cache-export-ungated 'Plex cache event gate exact-line count drift: observed=0 expected=1'
+assert_fails_with rewrite-catalogue-missing-guid \
+  'src/rewrite_modes.h missing exact line:     X(PLEX_GUID_LIKE'
+assert_fails_with rewrite-catalogue-browse-eligible \
+  'src/rewrite_modes.h missing exact line:     X(EMBY_BROWSE'
+assert_fails_with rewrite-resume-wrong-valid-token \
+  'Emby resume producer manifest invalid'
+assert_fails_with rewrite-guid-raw-producer \
+  'Plex prepare producer manifest OBS_MODE_PLEX_GUID_LIKE invalid'
+assert_fails_with rewrite-raw-wire-slow-query \
+  'src/slow_query_tracker.c contains rejected pattern:'
+assert_fails_with rewrite-docker-copy-missing \
+  'library dependency layers before all project COPY lines invalid'
+assert_fails_with rewrite-docker-count-restored-18 \
+  'library dependency layers before all project COPY lines invalid'
+assert_fails_with rewrite-runbook-row-drift \
+  'docs/runbooks/query-measure/families/emby-search.sh missing exact line:'
+assert_fails_with rewrite-abi-observability-header-missing \
+  'tests/abi_obsolete_config_ops_test.sh missing exact line:   cp "${repo_root}/src/observability.h"'
+assert_fails_with rewrite-abi-mode-header-missing \
+  'tests/abi_obsolete_config_ops_test.sh missing exact line:   cp "${repo_root}/src/rewrite_modes.h"'
 assert_fails_with stmt-sampling-source-literal 'STMT trace sampling literal-1 override missing'
 assert_fails_with stmt-sampling-doc-literal 'docs/env-vars.md missing exact line'
 assert_fails_with stmt-sampling-claude-literal 'CLAUDE STMT sampling knob missing from CLAUDE.md'

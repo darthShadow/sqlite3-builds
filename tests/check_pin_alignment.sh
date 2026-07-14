@@ -72,6 +72,87 @@ require_project_copies_after() {
   ' "$file" || fail "$label invalid in $file: expected $expected_count project COPY lines after '$marker'"
 }
 
+require_range_token_count() {
+  file="$1"
+  start="$2"
+  end="$3"
+  token="$4"
+  expected_count="$5"
+  label="$6"
+  awk -v start="$start" -v end="$end" -v token="$token" -v expected="$expected_count" '
+    $0 == start {
+      start_count++
+      active = 1
+    }
+    end != "__EOF__" && $0 == end {
+      end_count++
+      active = 0
+    }
+    active {
+      line = $0
+      while ((at = index(line, token)) != 0) {
+        count++
+        line = substr(line, at + length(token))
+      }
+    }
+    END {
+      end_ok = end == "__EOF__" ? 1 : end_count == 1
+      exit(start_count == 1 && end_ok && count == expected ? 0 : 1)
+    }
+  ' "$file" || fail "$label invalid in $file: expected $expected_count occurrences of $token"
+}
+
+require_range_order() {
+  file="$1"
+  start="$2"
+  end="$3"
+  label="$4"
+  first="$5"
+  second="$6"
+  third="$7"
+  fourth="$8"
+  fifth="$9"
+  shift 9
+  sixth="${1:-}"
+  seventh="${2:-}"
+  eighth="${3:-}"
+  awk -v start="$start" -v end="$end" -v first="$first" \
+      -v second="$second" -v third="$third" -v fourth="$fourth" \
+      -v fifth="$fifth" -v sixth="$sixth" -v seventh="$seventh" \
+      -v eighth="$eighth" '
+    BEGIN {
+      wanted[1] = first
+      wanted[2] = second
+      wanted[3] = third
+      wanted[4] = fourth
+      wanted[5] = fifth
+      wanted[6] = sixth
+      wanted[7] = seventh
+      wanted[8] = eighth
+      wanted_count = 5
+      if (sixth != "") wanted_count = 6
+      if (seventh != "") wanted_count = 7
+      if (eighth != "") wanted_count = 8
+    }
+    $0 == start {
+      start_count++
+      active = 1
+    }
+    end != "__EOF__" && $0 == end {
+      end_count++
+      active = 0
+    }
+    active && next_wanted < wanted_count &&
+      index($0, wanted[next_wanted + 1]) != 0 {
+      next_wanted++
+    }
+    END {
+      end_ok = end == "__EOF__" ? 1 : end_count == 1
+      exit(start_count == 1 && end_ok && next_wanted == wanted_count ? 0 : 1)
+    }
+  ' "$file" || fail "$label gate order invalid in $file"
+}
+
 legacy_scalar_keys() {
   printf '%s_%s_%s\n' PLEX IMAGE TAG
   printf '%s_%s_%s\n' EMBY IMAGE TAG
@@ -410,6 +491,223 @@ require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EM
 require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME " "'
 require_line src/plex_fts_rewrite.c '#define PLEX_TAG_INDEX_NAME "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line src/plex_fts_rewrite.c '#define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"'
+require_line src/rewrite_modes.h '#define OBS_REWRITE_MODE_CATALOG(X) \'
+require_line src/rewrite_modes.h '    X(PLEX_FTS, "plex", "fts+tag_type", "plex_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(PLEX_GUID_LIKE, "plex", "guid+like-null", "plex_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(PLEX_TAGGINGS, "plex", "taggings+membership", "plex_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(PLEX_ONDECK, "plex", "ondeck", "plex_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(EMBY_FTS, "emby", "fts+membership", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_BROWSE, "emby", "fanout+browse", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_FAVORITES, "emby", "fanout+favorites", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_LINKS_SEARCH, "emby", "fanout+links_search", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_PEOPLE, "emby", "fanout+people", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_RESUME, "emby", "fanout+resume", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_RESUME_SIMPLE, "emby", "fanout+resume_simple", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_SIMILAR, "emby", "fanout+similar", "emby_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)'
+require_line src/rewrite_modes.h 'typedef int32_t obs_rewrite_mode;'
+require_line src/rewrite_modes.h '    OBS_MODE_NONE = 0,'
+require_line src/rewrite_modes.h '    OBS_MODE_COUNT'
+awk '
+  /^    X\(/ {
+    rows++
+    row = $0
+    sub(/^    X\(/, "", row)
+    suffix = row
+    sub(/,.*/, "", suffix)
+    split($0, quoted, "\"")
+    wire = quoted[4]
+    suffix_seen[suffix]++
+    wire_seen[wire]++
+    if ($0 ~ /, 1\)( \\)?$/) eligible[suffix]++
+  }
+  END {
+    if (rows != 14) exit 1
+    for (suffix in suffix_seen) {
+      if (suffix_seen[suffix] != 1) exit 1
+      suffix_count++
+    }
+    for (wire in wire_seen) {
+      if (wire_seen[wire] != 1) exit 1
+      wire_count++
+    }
+    for (suffix in eligible) eligible_count++
+    if (suffix_count != 14 || wire_count != 14 || eligible_count != 4) exit 1
+    if (!eligible["PLEX_TAGGINGS"] || !eligible["PLEX_ONDECK"] ||
+        !eligible["EMBY_EPISODES_LATEST"] ||
+        !eligible["EMBY_MOVIES_LATEST"]) exit 1
+  }
+' src/rewrite_modes.h || fail 'rewrite mode catalogue cardinality, uniqueness, or eligibility invalid'
+
+require_range_token_count src/plex_fts_rewrite.c \
+  'static plex_match_result match_tag_membership_query(' \
+  'static int plex_expect_bytes(' OBS_MODE_PLEX_TAGGINGS 2 \
+  'Plex taggings producer manifest'
+require_range_token_count src/plex_fts_rewrite.c \
+  'static void plex_log_ondeck_miss(' \
+  'static int plex_ondeck_is_per_guid_variant(' OBS_MODE_PLEX_ONDECK 1 \
+  'Plex On-Deck miss producer manifest'
+require_range_token_count src/plex_fts_rewrite.c \
+  'static plex_match_result match_ondeck_query(' \
+  'static int plex_prepare_input_lengths(' OBS_MODE_PLEX_ONDECK 2 \
+  'Plex On-Deck producer manifest'
+for manifest in \
+  'OBS_MODE_PLEX_GUID_LIKE 2' \
+  'OBS_MODE_PLEX_FTS 2' \
+  'OBS_MODE_PLEX_TAGGINGS 2' \
+  'OBS_MODE_PLEX_ONDECK 2'
+do
+  set -- $manifest
+  require_range_token_count src/plex_fts_rewrite.c \
+    '__attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(' \
+    __EOF__ "$1" "$2" "Plex prepare producer manifest $1"
+done
+
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_build_resume_candidate(' \
+  'static emby_match_result emby_match_resume(' OBS_MODE_EMBY_RESUME 1 \
+  'Emby resume producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_favorites(' \
+  'static emby_match_result emby_match_browse(' OBS_MODE_EMBY_FAVORITES 1 \
+  'Emby favorites producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_browse(' \
+  'static emby_match_result emby_match_people(' OBS_MODE_EMBY_BROWSE 1 \
+  'Emby browse producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_people(' \
+  'static emby_match_result emby_match_links_search(' OBS_MODE_EMBY_PEOPLE 5 \
+  'Emby people producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_links_search(' \
+  'static emby_match_result emby_match_resume_simple(' OBS_MODE_EMBY_LINKS_SEARCH 7 \
+  'Emby links-search producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_resume_simple(' \
+  'static emby_match_result emby_match_similar(' OBS_MODE_EMBY_RESUME_SIMPLE 1 \
+  'Emby resume-simple producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_similar(' \
+  'static int latest_tail_has_guard(const char *zSql, size_t scan_len, const char *guard) {' \
+  OBS_MODE_EMBY_SIMILAR 1 \
+  'Emby similar producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_episodes_latest(' \
+  'static emby_match_result emby_match_movies_latest(' \
+  OBS_MODE_EMBY_EPISODES_LATEST 11 \
+  'Emby Episodes Latest producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_movies_latest(' \
+  'static char *emby_build_rewritten_sql(' OBS_MODE_EMBY_MOVIES_LATEST 11 \
+  'Emby movies Latest producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  '__attribute__((visibility("hidden"))) int emby_fts_rewrite_prepare(' \
+  __EOF__ OBS_MODE_EMBY_FTS 5 'Emby FTS producer manifest'
+plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
+emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
+assert_eq 'Plex producer token total' 13 "$plex_mode_token_count"
+assert_eq 'Emby producer token total' 44 "$emby_mode_token_count"
+
+raw_mode_wire_ere='"(fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest)"'
+for file in \
+  src/auto_extension.c \
+  src/emby_fts_rewrite.c \
+  src/fts_lex.c \
+  src/observability.c \
+  src/plex_fts_rewrite.c \
+  src/runtime_optimize.c \
+  src/slow_query_tracker.c
+do
+  reject_pattern "$file" "$raw_mode_wire_ere"
+done
+reject_pattern src/observability.c 'OBS_APPLIED_|OBS_INDEX_MISSING_MODE_COUNT|obs_applied_mode_index|obs_index_missing_slot'
+reject_pattern src/plex_fts_rewrite.c 'PLEX_MODE_|const char \*mode'
+reject_pattern src/emby_fts_rewrite.c 'const char \*mode|candidate[-.]>mode[[:space:]]*=[[:space:]]*"'
+reject_pattern src/observability.h 'const char \*mode'
+
+require_line src/observability.c '        obs_logf("observability",'
+require_line src/observability.c '            "event=obs_mode_unregistered mode_id=%" PRId32 " site=%s",'
+require_range_order src/observability.c \
+  '__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(' \
+  '__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_skipped(' \
+  'rewrite applied mode validation' \
+  'if (obs_is_disabled()) return;' \
+  'metadata = obs_rewrite_mode_lookup(mode, "rewrite_applied");' \
+  'state = obs_connection_state_get(db, 1);' \
+  '&state->applied_counts[mode_index]' \
+  'corr_result = obs_corr_set_observe(corr_set, corr);' \
+  'sample_label = obs_sample_label(count, corr_result);'
+require_range_order src/observability.c \
+  '__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(' \
+  'static void obs_emit_rewrite_applied(' \
+  'rewrite miss validation order' \
+  'if (obs_is_disabled()) return;' \
+  'reason_name = obs_miss_reason_name(reason);' \
+  'if (!reason_name) return;' \
+  'metadata = obs_rewrite_mode_lookup(mode, "rewrite_miss");' \
+  '&g_miss_counts[(unsigned int)reason][mode_index]' \
+  'obs_corr_set_observe(&g_miss_shape_set, key)' \
+  'sample_label = obs_sample_label(count, observed);'
+require_range_order src/observability.c \
+  '__attribute__((visibility("hidden"))) SQLITE_API void obs_log_index_missing(' \
+  'static uint64_t obs_mix_string(uint64_t hash, const char *value) {' \
+  'index-missing validation and admission order' \
+  'if (obs_is_disabled()) return;' \
+  'metadata = obs_rewrite_mode_lookup(mode, "index_missing");' \
+  'if (!metadata) return;' \
+  'if (metadata->index_missing_eligible == 0) return;' \
+  '&g_index_missing_counts[mode_index]' \
+  'sample_label = obs_sample_label(count, OBS_CORR_UNAVAILABLE);'
+require_range_order src/observability.c \
+  '__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_skipped(' \
+  'static void obs_decode_open_flags(int flags, char *buf, size_t n) {' \
+  'rewrite skipped validation order' \
+  'if (obs_is_disabled()) return;' \
+  'metadata = obs_rewrite_mode_lookup(mode, "rewrite_skipped");' \
+  'if (!metadata) return;' \
+  'obs_logf(' \
+  'metadata->target, reason, metadata->mode, (void *)db'
+
+require_line tests/abi_obsolete_config_ops_test.sh '  cp "${repo_root}/src/observability.h" "${tmpdir}/observability.h"'
+require_line tests/abi_obsolete_config_ops_test.sh '  cp "${repo_root}/src/rewrite_modes.h" "${tmpdir}/rewrite_modes.h"'
+require_line docs/runbooks/query-measure/families/plex-guid-like.sh '  grep -Fx '\''    X(PLEX_GUID_LIKE, "plex", "guid+like-null", "plex_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Plex GUID LIKE mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-fanout.sh '  grep -Fx '\''    X(EMBY_RESUME, "emby", "fanout+resume", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby resume mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-fanout.sh '  grep -Fx '\''    X(EMBY_RESUME_SIMPLE, "emby", "fanout+resume_simple", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby resume-simple mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\''    X(EMBY_PEOPLE, "emby", "fanout+people", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby People mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\''    X(EMBY_LINKS_SEARCH, "emby", "fanout+links_search", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby links-search mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby Episodes Latest mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby movies Latest mode catalogue contract drifted'\'''
+reject_line docs/runbooks/query-measure/families/plex-guid-like.sh '  grep -F '\''#define PLEX_MODE_GUID_LIKE "guid+like-null"'\'' "$source" >/dev/null || die '\''Plex GUID LIKE mode source contract drifted'\'''
+reject_pattern docs/runbooks/query-measure/families/emby-fanout.sh 'for _mode in.*fanout[+]resume'
+reject_pattern docs/runbooks/query-measure/families/emby-search.sh 'for _mode in.*fanout[+]people'
+reject_pattern docs/runbooks/query-measure/families/emby-dashboard.sh 'candidate->mode'
+require_nearby_line \
+  src/plex_fts_rewrite.c \
+  '    const char *value = getenv("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE");' \
+  '        (value && strcmp(value, "0") == 0) ? 1 : 0,' \
+  'Plex GUID LIKE rewrite literal-0 opt-in'
+require_nearby_line \
+  src/plex_fts_rewrite.c \
+  '    const char *value = getenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE");' \
+  '        (value && strcmp(value, "1") == 0) ? 0 : 1,' \
+  'Plex taggings rewrite literal-1 opt-out'
+require_nearby_line \
+  src/emby_fts_rewrite.c \
+  '    const char *value = getenv("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE");' \
+  '        (value && strcmp(value, "1") == 0) ? 0 : 1,' \
+  'Emby fan-out rewrite literal-1 opt-out'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` | kill-switch | Control the Plex GUID LIKE NULL-pattern guard rewrite. | GUID LIKE rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; build or verification failure prepares original SQL. |'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` | kill-switch | Control the Plex taggings-membership rewrite. | Taggings rewrite enabled in the Plex-ICU build. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing taggings index or rewrite failure prepares original SQL. |'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` | kill-switch | Control Emby fan-out rewrites: Browse-by-name, Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and links-search. | Fan-out rewrites enabled. | opt-out | Literal `1` disables the fan-out rewrites. | Unset, literal `0`, and any other value enable the fan-out rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, dashboard, and `SQLITE3_DISABLE_AUTOPRAGMA`. |'
+require_line CLAUDE.md '  `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` (GUID LIKE NULL guard) enables on'
+require_line CLAUDE.md '  literal `0`; unset, literal `1`, and every other value disable. It fails open'
+require_line CLAUDE.md '  Keep Plex taggings rewrite opt-out (default-on in the Plex/ICU build): literal'
+require_line CLAUDE.md '  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=1` disables; unset, literal `0`, and'
+require_line CLAUDE.md '  value enable. Keep Emby fan-out rewrite'
+require_line CLAUDE.md '  (`SQLITE3_DISABLE_EMBY_FANOUT_REWRITE`) opt-out (default-on in the Emby build):'
+require_line CLAUDE.md '  literal `1` disables; unset, literal `0`, and every other value enable. Keep'
 require_nearby_line \
   src/observability.c \
   '    const char *stmt_sampling = getenv("SQLITE3_DISABLE_STMT_TRACE_SAMPLING");' \
@@ -424,6 +722,11 @@ require_line docs/env-vars.md '| `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` | kill-sw
 require_line docs/env-vars.md '| `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` | kill-switch | Disable sampling for explicitly enabled STMT trace. | Enabled STMT trace logs the first callback, each bounded first-seen `corr` shape, and every 1024th callback per connection. | opt-out | Literal `1` logs every enabled STMT callback. | Unset, literal `0`, and any other value retain `sample=first`, `sample=periodic`, and `sample=new` hybrid sampling. | generic and Plex-ICU shared libraries. | Cached once per process. Never enables STMT trace; `SQLITE3_DISABLE_STMT_TRACE=0` and observability enabled are still required. |'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1' 'CLAUDE rewrite-applied SQL knob'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1' 'CLAUDE STMT sampling knob'
+require_line CLAUDE.md '  mimalloc dependency layers above all 19 project `COPY` lines; keep the'
+require_line CLAUDE.md '- Keep `src/rewrite_modes.h` as the only rewrite-mode catalogue. Producers pass'
+require_pattern CLAUDE.md 'Applied counters remain per connection' 'CLAUDE applied counter lifetime'
+require_pattern CLAUDE.md 'miss and index-missing counters remain process-global' 'CLAUDE global counter lifetimes'
+require_pattern CLAUDE.md 'Only Plex taggings' 'CLAUDE index-missing admission set'
 
 plex_icu_source_version="$(compat_group_pin icu69 icu_source_version)"
 plex_icu_source_sha512="$(compat_group_pin icu69 icu_source_sha512)"
@@ -653,8 +956,9 @@ require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
 require_project_copies_after \
   docker-library/Dockerfile \
   'ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a' \
-  18 \
+  19 \
   'library dependency layers before all project COPY lines'
+require_line docker-library/Dockerfile 'COPY src/rewrite_modes.h /app/rewrite_modes.h'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_URL'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
 require_line docker-library/Dockerfile 'ARG SQLITE_SRC_URL=""'

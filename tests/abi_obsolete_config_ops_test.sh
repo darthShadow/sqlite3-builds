@@ -131,6 +131,8 @@ else
   cp "${repo_root}/src/runtime_optimize.c" "${tmpdir}/runtime_optimize.c"
   cp "${repo_root}/src/auto_extension_internal.h" "${tmpdir}/auto_extension_internal.h"
   cp "${repo_root}/src/observability.c" "${tmpdir}/observability.c"
+  cp "${repo_root}/src/observability.h" "${tmpdir}/observability.h"
+  cp "${repo_root}/src/rewrite_modes.h" "${tmpdir}/rewrite_modes.h"
   cp "${repo_root}/src/fts_lex.c" "${tmpdir}/fts_lex.c"
   cp "${repo_root}/src/fts_lex.h" "${tmpdir}/fts_lex.h"
   cp "${repo_root}/src/plex_fts_rewrite.c" "${tmpdir}/plex_fts_rewrite.c"

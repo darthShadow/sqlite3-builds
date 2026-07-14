@@ -293,6 +293,14 @@ predicate column, and database basename together as Plex identifier isolation.
 `src/emby_fts_rewrite.c` owns the separate Emby rewrite path, and both rewrite
 paths consume the shared `src/fts_lex.c` scanner.
 
+`src/rewrite_modes.h` owns every rewrite-mode identity and wire label. Plex and
+Emby producers pass exact signed `OBS_MODE_*` ids through candidates and helper
+calls; no engine-owned free-form mode string remains. The central observability
+skip helper derives target, mode, and positional logger label from the same
+catalogue row. Producer selection, matcher gates, SQL construction, index
+probes, fail-open fallback, and applied-after-success ordering remain
+engine-owned and unchanged.
+
 Rationale: `unlikely(tag_type=X)` preserves affinity by wrapping the boolean result; `+tag_type`
 strips it (`unlikely(tag_type='6')` matched 614279 rows, `+tag_type='6'` matched 0). PMS inlines
 varying literals, so minimal anchors wrap any accepted value instead of a brittle byte-exact/full skeleton.
@@ -319,11 +327,49 @@ is a synthetic version-bump signal against the workflow-produced `cli/sqlite3`
 STAT4/FTS path. It requires `ENABLE_STAT4` and FTS3/FTS4 and asserts the
 original `tag_type`-first plan flips to an FTS-first `unlikely()` plan.
 
+## Plex GUID LIKE NULL Guard Rewrite
+
+The Plex GUID LIKE rewrite is opt-in:
+`SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE=0` enables it; unset, literal `1`, and
+every other value disable it. It is independent of
+`SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
+
+The matcher compares raw `zSql` bytes and accepts only this complete statement:
+
+```sql
+SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2
+```
+
+Case, whitespace, quoting, aliases, bind tokens, parentheses, projection,
+clauses, semicolons, embedded NULs, and multi-statement tails must match
+exactly. Every other shape prepares the original SQL.
+
+On a match, the helper prepares:
+
+```sql
+SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2
+```
+
+The repeated named `:1` token retains one bind slot, so bind count and names
+remain `:1` and `:2`. The projection and `LIMIT` stay unchanged. The prepared
+rewrite must expose two binds and one result column; mismatch, allocation
+failure, rewritten-prepare failure, or tail mismatch finalizes any rewritten
+statement and prepares the original SQL. Successful preparation maps `pzTail`
+to the end of the caller's original SQL buffer.
+
+For a NULL pattern, `LIKE` is NULL and cannot satisfy `WHERE`; the added guard
+allows SQLite to stop before scanning. For a non-NULL pattern, the guard is
+true and the original ICU `LIKE` expression determines every match with its
+existing Unicode case folding, BLOB handling, and collation behavior. The
+non-NULL plan remains a covering-index scan because the ICU-overloaded
+`like()` disqualifies SQLite's LIKE range optimization. This family does not
+add a range predicate or an index seek.
+
 ## Plex Taggings Membership Rewrite
 
-The Plex taggings rewrite is opt-in:
-`SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=0` enables it; unset, literal `1`, and
-every other value disable it. It is independent of
+The Plex taggings rewrite is opt-out and default-on:
+`SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=1` disables it; unset, literal `0`, and
+every other value enable it. It is independent of
 `SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
 
 The matcher accepts one `tags.id=<integer>` predicate in the same syntactic
@@ -360,8 +406,9 @@ an id-list-plus-threshold cross-product fail open. `library_section_id` and
 `account_id` accept an inlined decimal integer or a positional `?`/canonical
 `?N` in both variants. Each of those two scalar slots is parsed sequentially
 with SQLite numbering: bare `?` takes the next maximum index, explicit `?N` may
-create holes or be reused, and the rewrite emits each captured variable as an
-explicit `?N`. Only those two scalar slots can hold a variable. Named variables,
+create holes or be reused, and the rewrite copies each captured token verbatim,
+so bare `?` remains anonymous and explicit `?N` retains its name. Only those two
+scalar slots can hold a variable. Named variables,
 id-list variables, and noncanonical or out-of-limit indices fail open. The
 prepared rewrite's bind count is the two-slot maximum, verified against
 `sqlite3_bind_parameter_count` after prepare (`bind_count_mismatch` fails open).
@@ -383,16 +430,30 @@ Capture and out-of-scope records use process-global first/new/every-1024th
 sampling keyed by lexer-normalized structural shape while retaining full,
 uncapped source SQL on emitted records.
 
-On a match, the helper emits the grandparents-first ranked subquery, strips the
-vendor `INDEXED BY` hints by replacing the whole statement, and copies either
+On a match, the helper emits a ranked subquery with planner-selectable inner
+join order, strips the vendor `INDEXED BY` hints by replacing the whole
+statement, and copies either
 the Variant A `grandparents.id IN (...)` predicate or the Variant B
 `metadata_item_views.viewed_at > <literal>` predicate into the inner `WHERE`.
 It returns one row per `grandparents.id` with a deterministic `row_number()`
 tie-breaker ordered by `metadata_item_views.viewed_at`,
 `metadata_item_views.id`, `grandparentsSettings.id`, and
-`metadata_item_settings.id` descending. Build failure, rewritten-prepare
-failure, tail mismatch, bind-count mismatch, or index-probe failure finalizes
-any rewritten statement and prepares the original SQL.
+`metadata_item_settings.id` descending. Result column 4 uses the unary-plus
+expression `+viewed_at AS "max(viewed_at)"`, so its name remains
+`max(viewed_at)` while declared type, table, and origin metadata remain NULL
+like the vendor aggregate. The prepared rewrite must expose
+the template's seven result columns. Build failure, rewritten-prepare failure,
+tail mismatch, bind-count mismatch, column-count mismatch, or index-probe failure
+finalizes any rewritten statement and prepares the original SQL.
+
+The deterministic tie-break resolves SQLite's undefined bare-column
+representative for `max()`/`GROUP BY` ties; it does not introduce the potential
+divergence. A tied Plex group can expose different row values, including NULL
+`originally_available_at`, and an Emby group can expose different nullable
+dashboard values than the vendor statement happens to choose. The rewrites
+deliberately add no NULL hardening because consumers must already tolerate any
+representative the vendor query can return. Measured ties are rare: one real
+library had 11 tied On-Deck groups, 6 with a divergent representative.
 
 ## Emby FTS Search Rewrite
 
@@ -436,9 +497,9 @@ applying the validated rewrite.
 
 ## Emby Fan-Out Membership Rewrites
 
-The Emby fan-out rewrite family is opt-in:
-`SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` enables it; unset, literal `1`, and
-every other value disable it. It covers RES-A/RES-D complex resume,
+The Emby fan-out rewrite family is opt-out and default-on:
+`SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=1` disables it; unset, literal `0`, and
+every other value enable it. It covers RES-A/RES-D complex resume,
 resume-simple, Similar-items, Browse-by-name, Favorites-first, People, Studios,
 Type-29, and links-search fan-out statements. It is independent of
 `SQLITE3_DISABLE_EMBY_FTS_REWRITE` and
@@ -499,7 +560,12 @@ verbatim into the owned outer SELECT. It emits mode
 `dashboard+movies_latest` and C2 using
 `idx_dshadow_emby_latest_movies_dcn_puk` plus
 `idx_dshadow_emby_latest_movies_puk_dc_cover`; it has no native-index
-dependency. A no-guard statement is matcher-non-applying: Type=5 passes, the
+dependency. The anti-join keeps the maximum non-NULL `DateCreated` per
+`PresentationUniqueKey`, with the lower `Id` as the deterministic tie-break for
+equal dates; NULL wins only when every eligible date in the group is NULL. This
+deliberately replaces the vendor query's unspecified bare-column representative,
+so projected row identity and ordering can differ for multi-row groups. A
+no-guard statement is matcher-non-applying: Type=5 passes, the
 guarded tail misses, `capture_miss` logs when observability is enabled, and the
 original statement prepares.
 

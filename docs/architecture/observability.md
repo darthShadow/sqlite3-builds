@@ -6,7 +6,14 @@ Part of the [Repository Architecture index](../architecture.md).
 
 `src/observability.c` is compiled into both shared-library variants and is
 excluded from the CLI target. `src/observability.h` declares the private
-cross-translation-unit observability seam.
+cross-translation-unit observability seam. `src/rewrite_modes.h` is the only
+rewrite-mode catalogue. Its 14 signed `OBS_MODE_*` ids each own target, wire
+mode, positional logger label, and index-missing eligibility metadata.
+Applied, miss, and index-missing counters share the `OBS_MODE_COUNT` index
+space. Applied counters remain per connection; miss counters and their bounded
+shape set remain process-global; index-missing counters remain process-global.
+Only Plex taggings, Plex On-Deck, Emby Episodes Latest, and Emby movies Latest
+are index-missing eligible.
 
 The library target patches SQLite's amalgamation so these public APIs are
 implemented by wrappers in `src/observability.c` while the original SQLite
@@ -47,7 +54,8 @@ increases output. Literal
 emitted record while retaining counters and correlation keys; unset, literal
 `0`, and every other value retain them. This control is cached once per
 process, is subordinate to the master observability gate, and does not gate
-rewriting. Emby modes are `fts+membership`,
+rewriting. Plex modes are `fts+tag_type`, `guid+like-null`,
+`taggings+membership`, and `ondeck`. Emby modes are `fts+membership`,
 `fanout+resume`, `fanout+browse`, `fanout+favorites`, `fanout+people`,
 `fanout+links_search`, `fanout+resume_simple`, `fanout+similar`,
 `dashboard+episodes_latest`, and `dashboard+movies_latest`. No compatibility
@@ -78,6 +86,26 @@ path allocates the uncapped record; allocation or record-size failure emits a
 bounded fallback diagnostic and never changes prepare behavior. The key is a
 diagnostic join aid, not a unique identifier or security boundary. Early clean
 misses, missing-index paths, and index-probe errors do not emit capture SQL.
+
+Every mode-bearing API checks `SQLITE3_DISABLE_OBSERVABILITY` before mode
+lookup. Applied logging then acquires connection state, increments its mode
+counter, observes correlation, selects the schedule, and emits. Miss logging
+validates the miss reason before mode lookup, then increments its process-global
+counter, observes shape, selects the schedule, and emits. Index-missing logging
+looks up the mode, rejects registered ineligible rows before counter mutation,
+then selects its process-global schedule. Skip logging looks up the mode and
+emits without sampling. Invalid numeric ids return before clientdata access,
+allocation, counter mutation, or correlation observation and suppress the
+requested record. When observability is enabled, one shared atomic flag permits
+at most one invalid-id diagnostic per process. The diagnostic prints the signed
+`mode_id` and one of `rewrite_applied`, `rewrite_miss`, `index_missing`, or
+`rewrite_skipped` as `site`.
+
+The invalid-mode record uses positional logger label `observability` followed
+by payload
+`event=obs_mode_unregistered mode_id=<signed-decimal> site=<site>`; it does not
+emit a `fn=` field. The negative-first applied example contains
+` observability event=obs_mode_unregistered mode_id=-1 site=rewrite_applied`.
 With the base Plex On-Deck rewrite enabled, both the id-list and
 `viewed_at > <literal>` selector arms run. After the exact On-Deck head matches,
 parse drift emits `capture_miss` with first-failure `sub_reason` from `section`,
@@ -94,8 +122,8 @@ the exemplar handle while `count=` is process-wide. Probe errors remain
 unsuppressed. This path has no clientdata allocation dependency.
 Other fail-open rewrite reasons are `scalar_unavailable` for Emby FTS,
 `index_probe_error`, `build_failed`, `rewritten_prepare_failed`,
-`tail_mismatch`, and `bind_count_mismatch` for Plex On-Deck. They do not carry
-capture SQL.
+`tail_mismatch`, `bind_count_mismatch`, and `column_count_mismatch` for the
+verified Plex GUID-LIKE and On-Deck rewrites. They do not carry capture SQL.
 `SQLITE3_DISABLE_OBSERVABILITY` gates helper logs independently of
 `SQLITE3_DISABLE_STMT_TRACE`; pure passthrough and clean-miss paths do not log.
 

@@ -36,7 +36,8 @@ Bash config is sourced. They are outside the shared-library query path.
 | Env var | Type (kill-switch / numeric tunable) | Purpose | Default | Polarity (opt-in / opt-out / tunable) | Enable-or-value semantics | Other values (incl. unset) behavior | Build variant scope (generic / Plex-ICU / Emby) | Notes |
 |---|---|---|---|---|---|---|---|---|
 | `SQLITE3_DISABLE_PLEX_FTS_REWRITE` | kill-switch | Control the Plex FTS prefix-tag rewrite. | Plex FTS rewrite enabled in the Plex-ICU build. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Plex-ICU only. | Cached once per process. Non-Plex-ICU builds pass through original SQL. |
-| `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` | kill-switch | Control the Plex taggings-membership rewrite. | Taggings rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing taggings index or rewrite failure prepares original SQL. |
+| `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` | kill-switch | Control the Plex GUID LIKE NULL-pattern guard rewrite. | GUID LIKE rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; build or verification failure prepares original SQL. |
+| `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` | kill-switch | Control the Plex taggings-membership rewrite. | Taggings rewrite enabled in the Plex-ICU build. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing taggings index or rewrite failure prepares original SQL. |
 | `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` | kill-switch | Control the Plex On-Deck ranked-subquery rewrite. | On-Deck rewrite disabled. | opt-in | Literal `0` enables both the id-list and `viewed_at > <literal>` selector arms. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing g2 index or rewrite failure prepares original SQL. |
 
 ## Emby
@@ -44,13 +45,10 @@ Bash config is sourced. They are outside the shared-library query path.
 | Env var | Type (kill-switch / numeric tunable) | Purpose | Default | Polarity (opt-in / opt-out / tunable) | Enable-or-value semantics | Other values (incl. unset) behavior | Build variant scope (generic / Plex-ICU / Emby) | Notes |
 |---|---|---|---|---|---|---|---|---|
 | `SQLITE3_DISABLE_EMBY_FTS_REWRITE` | kill-switch | Control the Emby FTS scalar plus membership rewrite. | Emby FTS rewrite enabled. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of `SQLITE3_DISABLE_AUTOPRAGMA`. |
-| `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` | kill-switch | Control Emby fan-out rewrites: Browse-by-name, Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and links-search. | Fan-out rewrites disabled. | opt-in | Literal `0` enables the fan-out rewrites. | Unset, literal `1`, and any other value disable the fan-out rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, dashboard, and `SQLITE3_DISABLE_AUTOPRAGMA`. |
+| `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` | kill-switch | Control Emby fan-out rewrites: Browse-by-name, Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and links-search. | Fan-out rewrites enabled. | opt-out | Literal `1` disables the fan-out rewrites. | Unset, literal `0`, and any other value enable the fan-out rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, dashboard, and `SQLITE3_DISABLE_AUTOPRAGMA`. |
 | `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE` | kill-switch | Control the Emby Episodes-Latest and movies-Latest dashboard rewrites. | Dashboard rewrites disabled. | opt-in | Literal `0` enables both dashboard rewrites. | Unset, literal `1`, and any other value disable both dashboard rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, fan-out, and `SQLITE3_DISABLE_AUTOPRAGMA`; modes are `dashboard+episodes_latest` and `dashboard+movies_latest`. |
 
 Rewrite names follow `SQLITE3_DISABLE_<ENGINE>_<PURPOSE>_REWRITE`.
-Deployments that explicitly set `SQLITE3_DISABLE_EMBY_FTS_REWRITE=0` should
-also set `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` when they want the fan-out
-families optimized. This is advisory only; it is not required or code-enforced.
 
 ## Maintenance
 

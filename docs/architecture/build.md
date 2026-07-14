@@ -134,10 +134,10 @@ For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`,
 `/app/runtime_optimize.c`, `/app/observability.c`,
 `/app/slow_query_tracker.c`, `/app/fts_lex.c`,
 `/app/plex_fts_rewrite.c`, and `/app/emby_fts_rewrite.c`, with
-`/app/auto_extension_internal.h`, `/app/observability.h`, `/app/fts_lex.h`,
-`/app/plex_fts_rewrite.h`, and `/app/emby_fts_rewrite.h` as private headers,
-links a shared object, applies library-only feature defaults, and writes
-`dist/libsqlite3.so`.
+`/app/auto_extension_internal.h`, `/app/observability.h`,
+`/app/rewrite_modes.h`, `/app/fts_lex.h`, `/app/plex_fts_rewrite.h`, and
+`/app/emby_fts_rewrite.h` as private headers, links a shared object, applies
+library-only feature defaults, and writes `dist/libsqlite3.so`.
 
 For `library`, the link line prepends `MIMALLOC_OBJ`
 (`/opt/mimalloc/lib/mimalloc.o`) and `MIMALLOC_LIB`
@@ -176,6 +176,8 @@ build then compiles `sqlite3.c`, `/app/auto_extension.c`,
 `/app/plex_fts_rewrite.c`, and `/app/emby_fts_rewrite.c`;
 `/app/auto_extension_internal.h` is the auto-extension/runtime-optimize seam
 header, `/app/observability.h` is the shared observability seam header,
+`/app/rewrite_modes.h` is the header-only signed rewrite-mode identity,
+display, logger, and eligibility catalogue,
 `/app/fts_lex.h` is the shared FTS rewrite lexer header,
 `/app/plex_fts_rewrite.h` is the Plex prepare-wrapper/rewrite seam header, and
 `/app/emby_fts_rewrite.h` is the Emby prepare-wrapper/rewrite seam header.
@@ -184,6 +186,12 @@ target filtering, and the TLS seam, and reaches runtime optimize through
 `runtime_optimize_seed_path`; `/app/runtime_optimize.c` owns the runtime
 optimize logic. The CLI target does not run this patch and does not include
 observability, runtime optimize, or either FTS rewrite wrapper.
+
+`build/Build.sh:168-174` supplies `-I.` only. `/app/observability.c` includes
+`/app/observability.h` with a quoted include, and that header includes
+`rewrite_modes.h` with a quoted include, so lookup starts in `/app`.
+`rewrite_modes.h` creates no translation unit or exported symbol; `Build.sh`
+and its `sources=` list remain unchanged.
 
 After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
@@ -218,7 +226,7 @@ by Buildx.
 It copies `build/Build.sh`,
 `src/auto_extension.c`, `src/runtime_optimize.c`,
 `src/auto_extension_internal.h`, `src/observability.c`, `src/observability.h`,
-`src/slow_query_tracker.c`, `src/fts_lex.c`, `src/fts_lex.h`,
+`src/rewrite_modes.h`, `src/slow_query_tracker.c`, `src/fts_lex.c`, `src/fts_lex.h`,
 `src/plex_fts_rewrite.c`, `src/plex_fts_rewrite.h`,
 `src/emby_fts_rewrite.c`, `src/emby_fts_rewrite.h`, `tests/`,
 `build/sqlite-amalgamation.patch`, `build/expected-sqlite-config-count.txt`,

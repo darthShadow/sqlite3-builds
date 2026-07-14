@@ -59,6 +59,13 @@ static const char *ORDER_ONLY_TAG_TYPE_EQ_SQL =
 static const char *LEFT_BOUND_TAG_TYPE_EQ_SQL =
     "select tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and 1 + tag_type=4";
 
+static const char *GUID_LIKE_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2";
+static const char *GUID_LIKE_SQL_REWRITTEN =
+    "SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2";
+static const char *GUID_LIKE_NEGATIVE_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE mt.`guid` LIKE :1 LIMIT :2";
+
 #define TAG_MEMBERSHIP_10 " AND metadata_items.id IN (SELECT metadata_item_id FROM taggings WHERE tag_id=10)"
 
 static const char *TAG_BROWSE_SQL =
@@ -123,7 +130,7 @@ static const char *ONDECK_SQL_REWRITTEN =
     "       originally_available_at AS originally_available_at,\n"
     "       parent_index AS parent_index,\n"
     "       metadata_item_views_index AS \"index\",\n"
-    "       viewed_at AS \"max(viewed_at)\",\n"
+    "       +viewed_at AS \"max(viewed_at)\",\n"
     "       library_section_id AS library_section_id,\n"
     "       grandparents_extra_data AS extra_data\n"
     "FROM (\n"
@@ -136,7 +143,7 @@ static const char *ONDECK_SQL_REWRITTEN =
     "         grandparentsSettings.extra_data AS grandparents_extra_data,\n"
     "         row_number() OVER (PARTITION BY grandparents.id ORDER BY metadata_item_views.viewed_at DESC, metadata_item_views.id DESC, grandparentsSettings.id DESC, metadata_item_settings.id DESC) AS dshadow_on_deck_rank\n"
     "  FROM metadata_items AS grandparents\n"
-    "  CROSS JOIN metadata_item_views\n"
+    "  JOIN metadata_item_views\n"
     "  JOIN metadata_item_settings\n"
     "  JOIN metadata_item_settings AS grandparentsSettings\n"
     "  WHERE grandparents.guid=metadata_item_views.grandparent_guid\n"
@@ -157,7 +164,7 @@ static const char *ONDECK_THRESHOLD_SQL_REWRITTEN =
     "       originally_available_at AS originally_available_at,\n"
     "       parent_index AS parent_index,\n"
     "       metadata_item_views_index AS \"index\",\n"
-    "       viewed_at AS \"max(viewed_at)\",\n"
+    "       +viewed_at AS \"max(viewed_at)\",\n"
     "       library_section_id AS library_section_id,\n"
     "       grandparents_extra_data AS extra_data\n"
     "FROM (\n"
@@ -170,7 +177,7 @@ static const char *ONDECK_THRESHOLD_SQL_REWRITTEN =
     "         grandparentsSettings.extra_data AS grandparents_extra_data,\n"
     "         row_number() OVER (PARTITION BY grandparents.id ORDER BY metadata_item_views.viewed_at DESC, metadata_item_views.id DESC, grandparentsSettings.id DESC, metadata_item_settings.id DESC) AS dshadow_on_deck_rank\n"
     "  FROM metadata_items AS grandparents\n"
-    "  CROSS JOIN metadata_item_views\n"
+    "  JOIN metadata_item_views\n"
     "  JOIN metadata_item_settings\n"
     "  JOIN metadata_item_settings AS grandparentsSettings\n"
     "  WHERE grandparents.guid=metadata_item_views.grandparent_guid\n"
@@ -215,8 +222,6 @@ static const char *ONDECK_LEFT_JOIN_SQL =
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid left join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=2 and grandparents.id in (" ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_LIST_SQL =
     ONDECK_HEAD "2" ONDECK_AFTER_SECTION "101,?" ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
-static const char *ONDECK_PARAM_SECTION_SQL =
-    ONDECK_HEAD "?" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_ACCOUNT_SQL =
     ONDECK_HEAD "2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_BOTH_SQL =
@@ -271,6 +276,8 @@ static void failf(const char *fmt, ...) {
     exit(1);
 }
 
+#include "contract_parity.h"
+
 static void require_int(const char *label, int got, int want) {
     if (got != want) failf("FAIL [%s]: got=%d want=%d", label, got, want);
 }
@@ -284,6 +291,21 @@ static void require_str_eq(const char *label, const char *got, const char *want)
 static void require_contains(const char *label, const char *got, const char *needle) {
     if (!got || !strstr(got, needle)) {
         failf("FAIL [%s]: got=\"%s\" missing=\"%s\"", label, got ? got : "(null)", needle);
+    }
+}
+
+static void require_anonymous_parameter(const char *label, const char *got, const char *needle) {
+    size_t needle_len = strlen(needle);
+    const char *match = got ? strstr(got, needle) : NULL;
+
+    if (!match) {
+        failf("FAIL [%s]: got=\"%s\" missing=\"%s\"", label, got ? got : "(null)", needle);
+    }
+    if (needle_len == 0 || needle[needle_len - 1] != '?') {
+        failf("FATAL [%s]: anonymous-parameter needle must end with '?': \"%s\"", label, needle);
+    }
+    if (match[needle_len] >= '0' && match[needle_len] <= '9') {
+        failf("FAIL [%s]: got=\"%s\" want anonymous parameter after \"%s\"", label, got, needle);
     }
 }
 
@@ -413,6 +435,17 @@ static char *read_text_file(const char *path) {
     return buf;
 }
 
+static char *read_sql_fixture_payload(const char *path) {
+    char *buf = read_text_file(path);
+    size_t len = strlen(buf);
+
+    if (len == 0 || buf[len - 1] != '\n') {
+        failf("FATAL: SQL fixture %s must end with one repository framing LF", path);
+    }
+    buf[len - 1] = 0;
+    return buf;
+}
+
 static int safe_setenv(const char *name, const char *value) {
     if (setenv(name, value, 1) != 0) {
         fprintf(stderr, "setenv(%s=%s) failed: %s\n", name, value, strerror(errno));
@@ -448,10 +481,18 @@ static void configure_env_all(const char *fts_value, const char *tag_value, cons
     } else {
         if (!safe_unsetenv("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")) exit(1);
     }
+    if (!safe_unsetenv("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE")) exit(1);
+}
+
+static void configure_guid_like_env(const char *value) {
+    configure_env_all("1", "1", "1");
+    if (value) {
+        if (!safe_setenv("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE", value)) exit(1);
+    }
 }
 
 static void configure_env(const char *rewrite_value) {
-    configure_env_all(rewrite_value, NULL, NULL);
+    configure_env_all(rewrite_value, "1", NULL);
 }
 
 static int configure_obs_enabled_env(void) {
@@ -460,7 +501,7 @@ static int configure_obs_enabled_env(void) {
            safe_setenv("SQLITE3_DISABLE_STMT_TRACE", "1") &&
            safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "0") &&
-           safe_unsetenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1") &&
            safe_unsetenv("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE");
 }
 
@@ -482,6 +523,18 @@ static int configure_obs_tag_enabled_env(void) {
            safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "0") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1");
+}
+
+static int configure_obs_guid_like_enabled_env(void) {
+    return safe_setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1") &&
+           safe_setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1") &&
+           safe_setenv("SQLITE3_DISABLE_STMT_TRACE", "1") &&
+           safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY") &&
+           safe_unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE", "0") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1");
 }
 
@@ -637,104 +690,450 @@ static sqlite3_stmt *prepare_entry(
 );
 static sqlite3 *open_seeded_temp(const char *basename);
 
+static sqlite3_stmt *contract_prepare_v2(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char **tail
+) {
+    return prepare_entry(db, label, sql, -1, 2, tail);
+}
+
+typedef struct ondeck_bind_values {
+    int count;
+    int values[3];
+} ondeck_bind_values;
+
+typedef struct guid_like_bind_values {
+    const char *pattern;
+    int limit;
+} guid_like_bind_values;
+
+typedef struct ondeck_contract {
+    int expected_rows;
+    unsigned int expected_mask;
+    int account_2;
+} ondeck_contract;
+
+typedef struct plex_fts_tie_exception {
+    unsigned int accepted_rows;
+} plex_fts_tie_exception;
+
+/* MATCH_SQL_INT leaves equal count(*) rows unordered. Accept only the complete
+ * two-row permutation produced by the unchanged {10,11} result set. */
+static int accept_plex_fts_count_tie(
+    const char *label,
+    int row,
+    sqlite3_stmt *vendor,
+    sqlite3_stmt *candidate,
+    void *ctx
+) {
+    plex_fts_tie_exception *tie = (plex_fts_tie_exception *)ctx;
+    sqlite3_int64 vendor_id;
+    sqlite3_int64 candidate_id;
+    unsigned int bit;
+
+    (void)label;
+    if (row < 0 || row > 1 || sqlite3_column_type(vendor, 0) != SQLITE_INTEGER ||
+        sqlite3_column_type(candidate, 0) != SQLITE_INTEGER) {
+        return 0;
+    }
+    vendor_id = sqlite3_column_int64(vendor, 0);
+    candidate_id = sqlite3_column_int64(candidate, 0);
+    if (!((vendor_id == 10 && candidate_id == 11) ||
+          (vendor_id == 11 && candidate_id == 10))) {
+        return 0;
+    }
+    bit = 1u << row;
+    if ((tie->accepted_rows & bit) != 0) return 0;
+    tie->accepted_rows |= bit;
+    return 1;
+}
+
+static void bind_guid_like_values(
+    sqlite3_stmt *stmt,
+    const char *side,
+    const char *label,
+    void *ctx
+) {
+    guid_like_bind_values *binds = (guid_like_bind_values *)ctx;
+    int rc;
+
+    if (binds->pattern) {
+        rc = sqlite3_bind_text(stmt, 1, binds->pattern, -1, SQLITE_STATIC);
+    } else {
+        rc = sqlite3_bind_null(stmt, 1);
+    }
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s/%s-bind-pattern]: rc=%d", label, side, rc);
+    }
+    rc = sqlite3_bind_int(stmt, 2, binds->limit);
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s/%s-bind-limit]: rc=%d", label, side, rc);
+    }
+}
+
+static int accept_guid_like_legal_difference(
+    const char *label,
+    int row,
+    sqlite3_stmt *vendor,
+    sqlite3_stmt *candidate,
+    void *ctx
+) {
+    sqlite3_int64 vendor_id;
+    sqlite3_int64 candidate_id;
+
+    (void)label;
+    (void)row;
+    (void)ctx;
+    if (sqlite3_column_type(vendor, 0) != SQLITE_INTEGER ||
+        sqlite3_column_type(candidate, 0) != SQLITE_INTEGER) {
+        return 0;
+    }
+    vendor_id = sqlite3_column_int64(vendor, 0);
+    candidate_id = sqlite3_column_int64(candidate, 0);
+    return vendor_id >= 1 && vendor_id <= 6 &&
+        candidate_id >= 1 && candidate_id <= 6;
+}
+
+static void require_guid_like_legal_rows(
+    sqlite3 *db,
+    const char *label,
+    const char *side,
+    const char *sql,
+    const char *want_sql,
+    guid_like_bind_values *binds
+) {
+    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, NULL);
+    unsigned int mask = 0;
+    int rows = 0;
+    int rc;
+
+    require_str_eq(label, sqlite3_sql(stmt), want_sql);
+    bind_guid_like_values(stmt, side, label, binds);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        sqlite3_int64 id = sqlite3_column_int64(stmt, 0);
+        unsigned int bit;
+        if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER || id < 1 || id > 6) {
+            failf("FAIL [%s/%s-id]: type=%d id=%lld want=1..6", label, side,
+                  sqlite3_column_type(stmt, 0), (long long)id);
+        }
+        bit = 1u << (unsigned int)(id - 1);
+        if ((mask & bit) != 0) {
+            failf("FAIL [%s/%s-duplicate]: id=%lld mask=0x%x", label, side,
+                  (long long)id, mask);
+        }
+        mask |= bit;
+        rows++;
+    }
+    if (rc != SQLITE_DONE) {
+        failf("FAIL [%s/%s-step]: rc=%d err=%s", label, side, rc,
+              sqlite3_errmsg(db));
+    }
+    require_int(label, rows, 3);
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void bind_ondeck_values(
+    sqlite3_stmt *stmt,
+    const char *side,
+    const char *label,
+    void *ctx
+) {
+    ondeck_bind_values *binds = (ondeck_bind_values *)ctx;
+    int i;
+    for (i = 0; i < binds->count; i++) {
+        int rc = sqlite3_bind_int(stmt, i + 1, binds->values[i]);
+        if (rc != SQLITE_OK) {
+            failf("FAIL [%s/%s-bind-%d]: rc=%d", label, side, i + 1, rc);
+        }
+    }
+}
+
+static void require_ondeck_integer_cell(
+    const char *label,
+    const char *side,
+    sqlite3_stmt *stmt,
+    int column,
+    sqlite3_int64 want
+) {
+    int type = sqlite3_column_type(stmt, column);
+    sqlite3_int64 got = sqlite3_column_int64(stmt, column);
+    if (type != SQLITE_INTEGER || got != want) {
+        failf("FAIL [%s/tied-%s-column-%d]: type=%d value=%lld want_type=%d want=%lld",
+              label, side, column, type, (long long)got, SQLITE_INTEGER,
+              (long long)want);
+    }
+}
+
+static void require_ondeck_text_cell(
+    const char *label,
+    const char *side,
+    sqlite3_stmt *stmt,
+    int column,
+    const char *want
+) {
+    int type = sqlite3_column_type(stmt, column);
+    const unsigned char *got = sqlite3_column_text(stmt, column);
+    if (type != SQLITE_TEXT || !got || strcmp((const char *)got, want) != 0) {
+        failf("FAIL [%s/tied-%s-column-%d]: type=%d value=%s want_type=%d want=%s",
+              label, side, column, type, got ? (const char *)got : "(null)",
+              SQLITE_TEXT, want);
+    }
+}
+
+static void require_ondeck_candidate_row(
+    const char *label,
+    int row,
+    sqlite3_stmt *stmt,
+    const ondeck_contract *contract
+) {
+    if (contract->account_2) {
+        if (row != 0) {
+            failf("FAIL [%s/candidate-row]: row=%d want=0", label, row);
+        }
+        require_ondeck_integer_cell(label, "candidate", stmt, 0, 102);
+        require_ondeck_integer_cell(label, "candidate", stmt, 1, 105);
+        require_ondeck_integer_cell(label, "candidate", stmt, 2, 5);
+        require_ondeck_integer_cell(label, "candidate", stmt, 3, 5);
+        require_ondeck_integer_cell(label, "candidate", stmt, 4, 1400);
+        require_ondeck_integer_cell(label, "candidate", stmt, 5, 2);
+        require_ondeck_text_cell(
+            label, "candidate", stmt, 6, "gp102-account-2"
+        );
+        return;
+    }
+    if (row == 0) {
+        require_ondeck_integer_cell(label, "candidate", stmt, 0, 101);
+        require_ondeck_integer_cell(label, "candidate", stmt, 1, 103);
+        require_ondeck_integer_cell(label, "candidate", stmt, 2, 3);
+        require_ondeck_integer_cell(label, "candidate", stmt, 3, 3);
+        require_ondeck_integer_cell(label, "candidate", stmt, 4, 2000);
+        require_ondeck_integer_cell(label, "candidate", stmt, 5, 2);
+        require_ondeck_text_cell(label, "candidate", stmt, 6, "gp101-b");
+        return;
+    }
+    if (row == 1) {
+        require_ondeck_integer_cell(label, "candidate", stmt, 0, 102);
+        require_ondeck_integer_cell(label, "candidate", stmt, 1, 104);
+        require_ondeck_integer_cell(label, "candidate", stmt, 2, 4);
+        require_ondeck_integer_cell(label, "candidate", stmt, 3, 4);
+        require_ondeck_integer_cell(label, "candidate", stmt, 4, 1500);
+        require_ondeck_integer_cell(label, "candidate", stmt, 5, 2);
+        require_ondeck_text_cell(label, "candidate", stmt, 6, "gp102");
+        return;
+    }
+    failf("FAIL [%s/candidate-row]: row=%d want=0|1", label, row);
+}
+
+static unsigned int require_ondeck_vendor_row(
+    const char *label,
+    int row,
+    sqlite3_stmt *stmt,
+    const ondeck_contract *contract
+) {
+    sqlite3_int64 id = sqlite3_column_int64(stmt, 0);
+
+    if (sqlite3_column_type(stmt, 0) != SQLITE_INTEGER) {
+        failf("FAIL [%s/vendor-id]: type=%d want=%d", label,
+              sqlite3_column_type(stmt, 0), SQLITE_INTEGER);
+    }
+    if (!contract->account_2 && contract->expected_rows == 2 &&
+        id != (row == 0 ? 101 : 102)) {
+        failf("FAIL [%s/vendor-order]: row=%d got=%lld want=%d", label, row,
+              (long long)id, row == 0 ? 101 : 102);
+    }
+    if (id == 101) {
+        sqlite3_int64 originally_available_at = sqlite3_column_int64(stmt, 1);
+        sqlite3_int64 parent_index = sqlite3_column_int64(stmt, 2);
+        sqlite3_int64 index = sqlite3_column_int64(stmt, 3);
+        const unsigned char *extra_data = sqlite3_column_text(stmt, 6);
+        int episode_is_2 = originally_available_at == 102 &&
+            parent_index == 2 && index == 2;
+        int episode_is_3 = originally_available_at == 103 &&
+            parent_index == 3 && index == 3;
+        int extra_is_legal = sqlite3_column_type(stmt, 6) == SQLITE_TEXT &&
+            extra_data &&
+            (strcmp((const char *)extra_data, "gp101-a") == 0 ||
+             strcmp((const char *)extra_data, "gp101-b") == 0);
+
+        if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER ||
+            sqlite3_column_type(stmt, 2) != SQLITE_INTEGER ||
+            sqlite3_column_type(stmt, 3) != SQLITE_INTEGER ||
+            (!episode_is_2 && !episode_is_3) || !extra_is_legal) {
+            failf("FAIL [%s/vendor-101-representative]: oa=%lld parent=%lld "
+                  "index=%lld extra=%s", label,
+                  (long long)originally_available_at, (long long)parent_index,
+                  (long long)index,
+                  extra_data ? (const char *)extra_data : "(null)");
+        }
+        require_ondeck_integer_cell(label, "vendor", stmt, 4, 2000);
+        require_ondeck_integer_cell(label, "vendor", stmt, 5, 2);
+        return 1u;
+    }
+    if (id == 102) {
+        require_ondeck_integer_cell(
+            label, "vendor", stmt, 1, contract->account_2 ? 105 : 104
+        );
+        require_ondeck_integer_cell(
+            label, "vendor", stmt, 2, contract->account_2 ? 5 : 4
+        );
+        require_ondeck_integer_cell(
+            label, "vendor", stmt, 3, contract->account_2 ? 5 : 4
+        );
+        require_ondeck_integer_cell(
+            label, "vendor", stmt, 4, contract->account_2 ? 1400 : 1500
+        );
+        require_ondeck_integer_cell(label, "vendor", stmt, 5, 2);
+        require_ondeck_text_cell(
+            label, "vendor", stmt, 6,
+            contract->account_2 ? "gp102-account-2" : "gp102"
+        );
+        return 2u;
+    }
+    failf("FAIL [%s/vendor-id]: got=%lld want=101|102", label, (long long)id);
+    return 0;
+}
+
+static int accept_ondeck_legal_difference(
+    const char *label,
+    int row,
+    sqlite3_stmt *vendor,
+    sqlite3_stmt *candidate,
+    void *ctx
+) {
+    ondeck_contract *contract = (ondeck_contract *)ctx;
+
+    if (row < 0 || row >= contract->expected_rows) return 0;
+    (void)require_ondeck_vendor_row(label, row, vendor, contract);
+    require_ondeck_candidate_row(label, row, candidate, contract);
+    return 1;
+}
+
+static void require_ondeck_result_contract(
+    sqlite3 *db,
+    const char *label,
+    const char *side,
+    const char *sql,
+    const char *want_sql,
+    const ondeck_bind_values *binds,
+    const ondeck_contract *contract,
+    int candidate
+) {
+    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, NULL);
+    unsigned int vendor_mask = 0;
+    int row = 0;
+    int rc;
+
+    if (want_sql) {
+        require_str_eq(label, sqlite3_sql(stmt), want_sql);
+    } else if (!sqlite3_sql(stmt) || strcmp(sqlite3_sql(stmt), sql) == 0) {
+        failf("FAIL [%s/%s-rewrite-fired]: candidate SQL did not change", label, side);
+    }
+    bind_ondeck_values(stmt, side, label, (void *)binds);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (row >= contract->expected_rows) {
+            failf("FAIL [%s/%s-rows]: got>%d", label, side,
+                  contract->expected_rows);
+        }
+        if (candidate) {
+            require_ondeck_candidate_row(label, row, stmt, contract);
+        } else {
+            unsigned int bit = require_ondeck_vendor_row(
+                label, row, stmt, contract
+            );
+            if ((vendor_mask & bit) != 0) {
+                failf("FAIL [%s/vendor-duplicate]: mask=0x%x bit=0x%x",
+                      label, vendor_mask, bit);
+            }
+            vendor_mask |= bit;
+        }
+        row++;
+    }
+    if (rc != SQLITE_DONE) {
+        failf("FAIL [%s/%s-step]: rc=%d err=%s", label, side, rc,
+              sqlite3_errmsg(db));
+    }
+    require_int(label, row, contract->expected_rows);
+    if (!candidate) {
+        require_int(label, (int)vendor_mask, (int)contract->expected_mask);
+    }
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
 static void expect_ondeck_bound_parity(
     sqlite3 *db,
     const char *label,
     const char *sql,
     const char *rewrite_needle,
+    const char *expected_sql,
+    int check_anonymous_parameter,
     int expected_bind_count,
+    int expected_rows,
+    unsigned int expected_mask,
+    int account_2,
     int bind1,
     int bind2,
     int bind3
 ) {
     sqlite3 *original_db = open_seeded_temp("not-target.db");
-    sqlite3_stmt *original = prepare_entry(original_db, label, sql, -1, 2, NULL);
-    sqlite3_stmt *rewritten = prepare_entry(db, label, sql, -1, 2, NULL);
-    int bind_values[] = {bind1, bind2, bind3};
-    int rows_seen = 0;
-    int i;
+    ondeck_bind_values binds = {expected_bind_count, {bind1, bind2, bind3}};
+    ondeck_contract contract = {expected_rows, expected_mask, account_2};
+    sqlite3_stmt *probe = NULL;
 
-    require_int(label, sqlite3_bind_parameter_count(original), expected_bind_count);
-    require_int(label, sqlite3_bind_parameter_count(rewritten), expected_bind_count);
-    if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
-        require_contains(label, sqlite3_sql(rewritten), rewrite_needle);
-        require_contains(label, sqlite3_sql(rewritten), "dshadow_on_deck_rank");
+    if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
+        require_int(label, sqlite3_close(original_db), SQLITE_OK);
+        return;
+    }
+    probe = prepare_entry(db, label, sql, -1, 2, NULL);
+    if (check_anonymous_parameter) {
+        require_anonymous_parameter(label, sqlite3_sql(probe), rewrite_needle);
     } else {
-        require_str_eq(label, sqlite3_sql(rewritten), sql);
+        require_contains(label, sqlite3_sql(probe), rewrite_needle);
     }
-    for (i = 0; i < expected_bind_count; i++) {
-        require_int(label, sqlite3_bind_int(original, i + 1, bind_values[i]), SQLITE_OK);
-        require_int(label, sqlite3_bind_int(rewritten, i + 1, bind_values[i]), SQLITE_OK);
-    }
-    for (;;) {
-        int original_rc = sqlite3_step(original);
-        int rewritten_rc = sqlite3_step(rewritten);
-        int columns;
-
-        if (original_rc != rewritten_rc) {
-            failf("FAIL [%s/step]: original_rc=%d rewritten_rc=%d", label,
-                  original_rc, rewritten_rc);
-        }
-        if (original_rc == SQLITE_DONE) break;
-        if (original_rc != SQLITE_ROW) {
-            failf("FAIL [%s/step]: rc=%d want=SQLITE_ROW or SQLITE_DONE", label, original_rc);
-        }
-        rows_seen++;
-        columns = sqlite3_column_count(original);
-        require_int(label, sqlite3_column_count(rewritten), columns);
-        for (i = 0; i < columns; i++) {
-            if (i != 0 && i != 4 && i != 5) continue;
-            {
-                int original_type = sqlite3_column_type(original, i);
-                int rewritten_type = sqlite3_column_type(rewritten, i);
-                int original_bytes = sqlite3_column_bytes(original, i);
-                int rewritten_bytes = sqlite3_column_bytes(rewritten, i);
-                const void *original_value = sqlite3_column_blob(original, i);
-                const void *rewritten_value = sqlite3_column_blob(rewritten, i);
-
-                if (original_type != rewritten_type) {
-                    failf("FAIL [%s/column-type]: column=%d original=%d rewritten=%d",
-                          label, i, original_type, rewritten_type);
-                }
-                if (original_bytes != rewritten_bytes) {
-                    failf("FAIL [%s/column-bytes]: column=%d original=%d rewritten=%d",
-                          label, i, original_bytes, rewritten_bytes);
-                }
-                if (original_bytes > 0 &&
-                    memcmp(original_value, rewritten_value, (size_t)original_bytes) != 0) {
-                    failf("FAIL [%s/column-value]: column=%d byte_count=%d differs",
-                          label, i, original_bytes);
-                }
-            }
-        }
-    }
-    if (rows_seen == 0) failf("FAIL [%s/rows]: got=0 want=>0", label);
-    require_int(label, sqlite3_finalize(original), SQLITE_OK);
-    require_int(label, sqlite3_finalize(rewritten), SQLITE_OK);
+    require_contains(label, sqlite3_sql(probe), "dshadow_on_deck_rank");
+    require_int(label, sqlite3_finalize(probe), SQLITE_OK);
+    contract_parity_require(
+        original_db, db, contract_prepare_v2, label, sql, sql, expected_sql,
+        bind_ondeck_values, &binds,
+        accept_ondeck_legal_difference, &contract
+    );
+    require_ondeck_result_contract(
+        original_db, label, "vendor", sql, sql, &binds, &contract, 0
+    );
+    require_ondeck_result_contract(
+        db, label, "candidate", sql, expected_sql, &binds, &contract, 1
+    );
     require_int(label, sqlite3_close(original_db), SQLITE_OK);
 }
 
-static void expect_ondeck_rows(sqlite3 *db) {
-    sqlite3_stmt *stmt = prepare_entry(db, "ondeck-rows", ONDECK_SQL, -1, 2, NULL);
-    int rc;
+static void expect_ondeck_contract(
+    sqlite3 *db,
+    const char *label,
+    const char *source_sql,
+    const char *expected_sql,
+    int expected_rows,
+    unsigned int expected_mask
+) {
+    sqlite3 *vendor_db = open_seeded_temp("not-target.db");
+    ondeck_bind_values binds = {0, {0, 0, 0}};
+    ondeck_contract contract = {expected_rows, expected_mask, 0};
 
-    require_str_eq("ondeck-rows/sql", sqlite3_sql(stmt), ONDECK_SQL_REWRITTEN);
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) failf("FAIL [ondeck-rows/first]: rc=%d want=SQLITE_ROW", rc);
-    require_int("ondeck-rows/first-id", sqlite3_column_int(stmt, 0), 101);
-    require_int("ondeck-rows/first-index", sqlite3_column_int(stmt, 3), 3);
-    require_int("ondeck-rows/first-viewed", sqlite3_column_int(stmt, 4), 2000);
-    require_str_eq("ondeck-rows/first-extra",
-                   (const char *)sqlite3_column_text(stmt, 6), "gp101-b");
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) failf("FAIL [ondeck-rows/second]: rc=%d want=SQLITE_ROW", rc);
-    require_int("ondeck-rows/second-id", sqlite3_column_int(stmt, 0), 102);
-    require_int("ondeck-rows/second-viewed", sqlite3_column_int(stmt, 4), 1500);
-    require_str_eq("ondeck-rows/second-extra",
-                   (const char *)sqlite3_column_text(stmt, 6), "gp102");
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_DONE) failf("FAIL [ondeck-rows/done]: rc=%d want=SQLITE_DONE", rc);
-    require_int("ondeck-rows/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+    create_ondeck_index(vendor_db);
+    contract_parity_require(
+        vendor_db, db, contract_prepare_v2, label, source_sql, source_sql,
+        expected_sql, NULL, NULL,
+        accept_ondeck_legal_difference, &contract
+    );
+    require_ondeck_result_contract(
+        vendor_db, label, "vendor", source_sql, source_sql, &binds,
+        &contract, 0
+    );
+    require_ondeck_result_contract(
+        db, label, "candidate", source_sql, expected_sql, &binds,
+        &contract, 1
+    );
+    require_int(label, sqlite3_close(vendor_db), SQLITE_OK);
 }
 
 static int authorizer_cb(
@@ -1080,6 +1479,62 @@ static void expect_tag_applied_log(sqlite3 *db, const char *log_path, int count)
     }
 }
 
+static void expect_guid_like_applied_log(
+    sqlite3 *db_a,
+    sqlite3 *db_b,
+    const char *log_path
+) {
+    sqlite3 *dbs[] = {db_a, db_b};
+    int saved_stderr;
+    int log_fd;
+    size_t db_index;
+
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) failf("FATAL: dup(stderr) failed: %s", strerror(errno));
+    log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (log_fd < 0) {
+        close(saved_stderr);
+        failf("FATAL: open %s failed: %s", log_path, strerror(errno));
+    }
+    if (dup2(log_fd, STDERR_FILENO) < 0) {
+        close(log_fd);
+        close(saved_stderr);
+        failf("FATAL: dup2(stderr) failed: %s", strerror(errno));
+    }
+    close(log_fd);
+
+    for (db_index = 0; db_index < sizeof(dbs) / sizeof(dbs[0]); db_index++) {
+        int i;
+        for (i = 0; i < 1025; i++) {
+            sqlite3_stmt *stmt = NULL;
+            const char *tail = NULL;
+            int rc = sqlite3_prepare_v2(dbs[db_index], GUID_LIKE_SQL, -1, &stmt, &tail);
+            if (rc != SQLITE_OK) {
+                failf(
+                    "FAIL [guid-like-applied/prepare]: db=%lu i=%d rc=%d err=%s",
+                    (unsigned long)db_index, i, rc, sqlite3_errmsg(dbs[db_index])
+                );
+            }
+            require_str_eq(
+                "guid-like-applied/sql", sqlite3_sql(stmt), GUID_LIKE_SQL_REWRITTEN
+            );
+            if (tail != GUID_LIKE_SQL + strlen(GUID_LIKE_SQL)) {
+                failf(
+                    "FAIL [guid-like-applied/tail]: db=%lu i=%d got=%ld want=%ld",
+                    (unsigned long)db_index, i, (long)(tail - GUID_LIKE_SQL),
+                    (long)strlen(GUID_LIKE_SQL)
+                );
+            }
+            require_int(
+                "guid-like-applied/finalize", sqlite3_finalize(stmt), SQLITE_OK
+            );
+        }
+    }
+    fflush(stderr);
+    if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
+    close(saved_stderr);
+}
+
 static void expect_legacy_authorizer(sqlite3 *db, int expect_rewrite) {
     auth_probe probe = {0, 0};
     sqlite3_stmt *stmt = NULL;
@@ -1275,14 +1730,60 @@ static sqlite3 *open_seeded_temp(const char *basename) {
     return db;
 }
 
+static sqlite3 *open_seeded_target_in_subdir(const char *subdir) {
+    char dir[512];
+    char path[768];
+    sqlite3 *db;
+    int rc;
+
+    temp_path(dir, sizeof(dir), subdir);
+    if (mkdir(dir, 0700) != 0) {
+        failf("FATAL: mkdir %s failed: %s", dir, strerror(errno));
+    }
+    rc = snprintf(
+        path, sizeof(path), "%s/com.plexapp.plugins.library.db", dir
+    );
+    if (rc < 0 || (size_t)rc >= sizeof(path)) {
+        failf("FATAL: target subdirectory path overflow");
+    }
+    db = open_db(path);
+    setup_schema(db);
+    return db;
+}
+
+static void cleanup_seeded_target_subdir(const char *subdir) {
+    static const char *suffixes[] = {"", "-wal", "-shm"};
+    char dir[512];
+    char path[768];
+    size_t i;
+
+    temp_path(dir, sizeof(dir), subdir);
+    for (i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        int rc = snprintf(
+            path, sizeof(path), "%s/com.plexapp.plugins.library.db%s",
+            dir, suffixes[i]
+        );
+        if (rc < 0 || (size_t)rc >= sizeof(path)) {
+            failf("FATAL: target subdirectory cleanup path overflow");
+        }
+        unlink(path);
+    }
+    if (rmdir(dir) != 0) {
+        failf("FATAL: rmdir %s failed: %s", dir, strerror(errno));
+    }
+}
+
 static int child_positive(void) {
     int expect_rewrite;
+    plex_fts_tie_exception fts_tie = {0};
     sqlite3 *db;
+    sqlite3 *vendor_db;
 
     configure_env("0");
     make_temp_dir();
     expect_rewrite = sqlite3_compileoption_used("ENABLE_ICU") != 0;
     db = open_seeded_temp("com.plexapp.plugins.library.db");
+    vendor_db = open_seeded_temp("not-target.db");
     expect_saved_sql(db, "v2-int", MATCH_SQL_INT, -1, 2,
                      expect_rewrite ? MATCH_SQL_INT_REWRITTEN : MATCH_SQL_INT);
     expect_saved_sql(db, "v3-int", MATCH_SQL_INT, -1, 3,
@@ -1305,7 +1806,19 @@ static int child_positive(void) {
     }
     expect_legacy_authorizer(db, expect_rewrite);
     expect_grouped_digest_identity(db);
+    if (expect_rewrite) {
+        contract_parity_require(
+            vendor_db, db, contract_prepare_v2, "plex-fts-contract", MATCH_SQL_INT, MATCH_SQL_INT,
+            MATCH_SQL_INT_REWRITTEN, NULL, NULL,
+            accept_plex_fts_count_tie, &fts_tie
+        );
+        if (fts_tie.accepted_rows != 0 && fts_tie.accepted_rows != 3) {
+            failf("FAIL [plex-fts-contract/tied-order]: accepted=0x%x want=0x0|0x3",
+                  fts_tie.accepted_rows);
+        }
+    }
     exec_sql(db, "exec-miss", "PRAGMA user_version;");
+    require_int("positive/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
     require_int("positive/close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
     printf("PASS [positive]: expect_rewrite=%d\n", expect_rewrite);
@@ -1420,6 +1933,71 @@ static int child_nonmatch(void) {
     return 0;
 }
 
+static int child_guid_like(void) {
+    guid_like_bind_values null_binds = {NULL, 3};
+    guid_like_bind_values prefix_binds = {"plex://item/%", 3};
+    sqlite3 *vendor_db;
+    sqlite3 *candidate_db;
+
+    configure_guid_like_env("0");
+    make_temp_dir();
+    vendor_db = open_seeded_temp("not-target.db");
+    candidate_db = open_seeded_temp("com.plexapp.plugins.library.db");
+    if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
+        contract_parity_require_min_rows(
+            vendor_db, candidate_db, contract_prepare_v2, "guid-like-null-contract",
+            GUID_LIKE_SQL, GUID_LIKE_SQL, GUID_LIKE_SQL_REWRITTEN,
+            bind_guid_like_values, &null_binds, NULL, NULL, 0
+        );
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2, "guid-like-prefix-contract",
+            GUID_LIKE_SQL, GUID_LIKE_SQL, GUID_LIKE_SQL_REWRITTEN,
+            bind_guid_like_values, &prefix_binds,
+            accept_guid_like_legal_difference, NULL
+        );
+        require_guid_like_legal_rows(
+            vendor_db, "guid-like-prefix-contract", "vendor", GUID_LIKE_SQL,
+            GUID_LIKE_SQL, &prefix_binds
+        );
+        require_guid_like_legal_rows(
+            candidate_db, "guid-like-prefix-contract", "candidate", GUID_LIKE_SQL,
+            GUID_LIKE_SQL_REWRITTEN, &prefix_binds
+        );
+        expect_saved_sql(
+            candidate_db, "guid-like-shape-negative", GUID_LIKE_NEGATIVE_SQL,
+            -1, 2, GUID_LIKE_NEGATIVE_SQL
+        );
+    }
+    require_int("guid-like/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
+    require_int("guid-like/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [guid-like]\n");
+    return 0;
+}
+
+static int child_guid_like_env_case(
+    const char *value,
+    const char *label,
+    int env_enables_rewrite
+) {
+    sqlite3 *db;
+    int expect_rewrite;
+
+    configure_guid_like_env(value);
+    make_temp_dir();
+    expect_rewrite = env_enables_rewrite &&
+        sqlite3_compileoption_used("ENABLE_ICU") != 0;
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    expect_saved_sql(
+        db, label, GUID_LIKE_SQL, -1, 2,
+        expect_rewrite ? GUID_LIKE_SQL_REWRITTEN : GUID_LIKE_SQL
+    );
+    require_int(label, sqlite3_close(db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [%s]\n", label);
+    return 0;
+}
+
 static int child_tag_membership(void) {
     int expect_rewrite;
     sqlite3 *db;
@@ -1501,6 +2079,14 @@ static int child_tag_row_parity(void) {
     exec_sql(rewritten_db, "tag-row-parity-rewritten-extra",
              "INSERT INTO taggings(id,metadata_item_id,tag_id,`index`) VALUES(7,2,10,7);");
 
+    if (expect_rewrite) {
+        contract_parity_require(
+            original_db, rewritten_db, contract_prepare_v2, "plex-taggings-contract",
+            TAG_LIMIT_SQL, TAG_LIMIT_SQL, TAG_LIMIT_SQL_REWRITTEN,
+            NULL, NULL, NULL, NULL
+        );
+    }
+
     collect_first_int_ids(original_db, "tag-row-parity-original", TAG_LIMIT_SQL, -1, 0,
                           original_ids, sizeof(original_ids));
     collect_first_int_ids(rewritten_db, "tag-row-parity-rewritten", TAG_LIMIT_SQL,
@@ -1534,6 +2120,8 @@ static int child_tag_env_case(const char *value, const char *label, int env_enab
 }
 
 static int child_ondeck(void) {
+    char *bound_section_sql;
+    char *bound_section_expected;
     int expect_rewrite;
     sqlite3 *db;
     sqlite3 *missing_index_db;
@@ -1544,31 +2132,43 @@ static int child_ondeck(void) {
     expect_rewrite = sqlite3_compileoption_used("ENABLE_ICU") != 0;
     db = open_seeded_temp("com.plexapp.plugins.library.db");
     create_ondeck_index(db);
+    bound_section_sql = read_sql_fixture_payload(
+        "tests/fixtures/plex-fts-rewrite/ondeck-bound-section.sql"
+    );
+    bound_section_expected = read_sql_fixture_payload(
+        "tests/fixtures/plex-fts-rewrite/ondeck-bound-section.expected.sql"
+    );
     expect_saved_sql(db, "ondeck-positive", ONDECK_SQL, -1, 2,
                      expect_rewrite ? ONDECK_SQL_REWRITTEN : ONDECK_SQL);
     expect_saved_sql(db, "ondeck-variant-a-byte-identity", ONDECK_SQL, -1, 2,
                      expect_rewrite ? ONDECK_SQL_REWRITTEN : ONDECK_SQL);
-    if (expect_rewrite) expect_ondeck_rows(db);
+    if (expect_rewrite) {
+        expect_ondeck_contract(
+            db, "ondeck-id-list-contract", ONDECK_SQL, ONDECK_SQL_REWRITTEN,
+            2, 3
+        );
+    }
     expect_saved_sql(db, "ondeck-left-join", ONDECK_LEFT_JOIN_SQL, -1, 2,
                      ONDECK_LEFT_JOIN_SQL);
     expect_saved_sql(db, "ondeck-param-list", ONDECK_PARAM_LIST_SQL, -1, 2,
                      ONDECK_PARAM_LIST_SQL);
-    expect_ondeck_bound_parity(db, "ondeck-param-section", ONDECK_PARAM_SECTION_SQL,
-                               "library_section_id=?1", 1, 2, 42, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-section", bound_section_sql,
+                               "library_section_id=?", bound_section_expected,
+                               0, 1, 2, 3, 0, 2, 42, 0);
     expect_ondeck_bound_parity(db, "ondeck-param-account", ONDECK_PARAM_ACCOUNT_SQL,
-                               "account_id=?1", 1, 42, 2, 0);
+                               "account_id=?", NULL, 1, 1, 2, 3, 0, 42, 2, 0);
     expect_ondeck_bound_parity(db, "ondeck-param-both", ONDECK_PARAM_BOTH_SQL,
-                               "library_section_id=?1", 2, 2, 42, 0);
+                               "library_section_id=?", NULL, 1, 2, 2, 3, 0, 2, 42, 0);
     expect_ondeck_bound_parity(db, "ondeck-param-reversed", ONDECK_PARAM_REVERSED_SQL,
-                               "library_section_id=?2", 2, 42, 2, 0);
+                               "library_section_id=?2", NULL, 0, 2, 2, 3, 0, 42, 2, 0);
     expect_ondeck_bound_parity(db, "ondeck-param-hole", ONDECK_PARAM_HOLE_SQL,
-                               "account_id=?3", 3, 0, 2, 42);
+                               "account_id=?", NULL, 1, 3, 2, 3, 0, 0, 2, 42);
     expect_ondeck_bound_parity(db, "ondeck-param-reuse-forward",
                                ONDECK_PARAM_REUSE_FORWARD_SQL,
-                               "account_id=?1", 1, 2, 2, 0);
+                               "account_id=?1", NULL, 0, 1, 1, 2, 1, 2, 2, 0);
     expect_ondeck_bound_parity(db, "ondeck-param-reuse-reverse",
                                ONDECK_PARAM_REUSE_REVERSE_SQL,
-                               "account_id=?1", 1, 2, 2, 0);
+                               "account_id=?1", NULL, 0, 1, 1, 2, 1, 2, 2, 0);
     expect_saved_sql(db, "ondeck-param-leading-zero", ONDECK_PARAM_LEADING_ZERO_SQL, -1, 2,
                      ONDECK_PARAM_LEADING_ZERO_SQL);
     expect_saved_sql(db, "ondeck-duplicate-account", ONDECK_DUP_ACCOUNT_SQL, -1, 2,
@@ -1581,6 +2181,8 @@ static int child_ondeck(void) {
                      ONDECK_MISSING_SETTINGS_ACCOUNT_SQL);
     expect_saved_sql(db, "ondeck-projection-drift", ONDECK_PROJECTION_DRIFT_SQL, -1, 2,
                      ONDECK_PROJECTION_DRIFT_SQL);
+    free(bound_section_sql);
+    free(bound_section_expected);
     require_int("ondeck/close", sqlite3_close(db), SQLITE_OK);
 
     missing_index_db = open_seeded_temp("com.plexapp.plugins.library.db");
@@ -1632,18 +2234,24 @@ static int child_ondeck_threshold(void) {
     create_ondeck_index(db);
     expect_saved_sql(db, "ondeck-threshold-exact", ONDECK_THRESHOLD_SQL, -1, 2,
                      expect_rewrite ? ONDECK_THRESHOLD_SQL_REWRITTEN : ONDECK_THRESHOLD_SQL);
+    if (expect_rewrite) {
+        expect_ondeck_contract(
+            db, "ondeck-threshold-contract", ONDECK_THRESHOLD_SQL,
+            ONDECK_THRESHOLD_SQL_REWRITTEN, 1, 1
+        );
+    }
     expect_ondeck_bound_parity(db, "ondeck-threshold-inline", ONDECK_THRESHOLD_SQL,
                                "metadata_item_views.viewed_at > " ONDECK_THRESHOLD,
-                               0, 0, 0, 0);
+                               NULL, 0, 0, 1, 1, 0, 0, 0, 0);
     expect_ondeck_bound_parity(db, "ondeck-threshold-param-section",
                                ONDECK_THRESHOLD_PARAM_SECTION_SQL,
-                               "library_section_id=?1", 1, 2, 0, 0);
+                               "library_section_id=?", NULL, 1, 1, 1, 1, 0, 2, 0, 0);
     expect_ondeck_bound_parity(db, "ondeck-threshold-param-account",
                                ONDECK_THRESHOLD_PARAM_ACCOUNT_SQL,
-                               "account_id=?1", 1, 42, 0, 0);
+                               "account_id=?", NULL, 1, 1, 1, 1, 0, 42, 0, 0);
     expect_ondeck_bound_parity(db, "ondeck-threshold-param-both",
                                ONDECK_THRESHOLD_PARAM_BOTH_SQL,
-                               "library_section_id=?1", 2, 2, 42, 0);
+                               "library_section_id=?", NULL, 1, 2, 1, 1, 0, 2, 42, 0);
     for (i = 0; i < sizeof(negatives) / sizeof(negatives[0]); i++) {
         expect_ondeck_static_negative(
             db, negatives[i].label, negatives[i].sql, negatives[i].needle
@@ -1773,6 +2381,75 @@ static int child_tag_applied_log(void) {
     unlink(log_path);
     cleanup_temp_dir();
     printf("PASS [tag-applied-log]\n");
+    return 0;
+}
+
+static int child_guid_like_applied_sampling(void) {
+    static const char *needle =
+        "event=rewrite_applied target=plex mode=guid+like-null db=";
+    sqlite3 *db_a;
+    sqlite3 *db_b;
+    char log_path[512];
+    char source_field[512];
+    char rewritten_field[512];
+    char *log_text;
+    int rc;
+
+    if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
+        printf("SKIP [guid-like-applied-sampling]: ENABLE_ICU=0\n");
+        return 0;
+    }
+    if (!configure_obs_guid_like_enabled_env()) return 1;
+    make_temp_dir();
+    temp_path(log_path, sizeof(log_path), "guid-like-applied.stderr");
+    unlink(log_path);
+    db_a = open_seeded_target_in_subdir("guid-like-a");
+    db_b = open_seeded_target_in_subdir("guid-like-b");
+    expect_guid_like_applied_log(db_a, db_b, log_path);
+    log_text = read_text_file(log_path);
+    require_occurrences("guid-like-applied/records", log_text, needle, 4);
+    require_occurrences(
+        "guid-like-applied/first", log_text, "sample=first count=1", 2
+    );
+    require_occurrences(
+        "guid-like-applied/periodic", log_text,
+        "sample=periodic count=1024", 2
+    );
+    require_no_same_line(
+        "guid-like-applied/new", log_text, needle, "sample=new"
+    );
+    require_no_same_line("guid-like-applied/count-2", log_text, needle, "count=2");
+    require_no_same_line("guid-like-applied/count-3", log_text, needle, "count=3");
+    require_no_same_line(
+        "guid-like-applied/count-1025", log_text, needle, "count=1025"
+    );
+    rc = snprintf(
+        source_field, sizeof(source_field), "source_sql=\"%s\"", GUID_LIKE_SQL
+    );
+    if (rc < 0 || (size_t)rc >= sizeof(source_field)) {
+        failf("FATAL: guid-like source field overflow");
+    }
+    rc = snprintf(
+        rewritten_field, sizeof(rewritten_field),
+        "sql=\"%s\"", GUID_LIKE_SQL_REWRITTEN
+    );
+    if (rc < 0 || (size_t)rc >= sizeof(rewritten_field)) {
+        failf("FATAL: guid-like rewritten field overflow");
+    }
+    require_occurrences(
+        "guid-like-applied/source SQL", log_text, source_field, 4
+    );
+    require_occurrences(
+        "guid-like-applied/rewritten SQL", log_text, rewritten_field, 4
+    );
+    free(log_text);
+    require_int("guid-like-applied/close-a", sqlite3_close(db_a), SQLITE_OK);
+    require_int("guid-like-applied/close-b", sqlite3_close(db_b), SQLITE_OK);
+    cleanup_seeded_target_subdir("guid-like-a");
+    cleanup_seeded_target_subdir("guid-like-b");
+    unlink(log_path);
+    cleanup_temp_dir();
+    printf("PASS [guid-like-applied-sampling]\n");
     return 0;
 }
 
@@ -2109,11 +2786,22 @@ static int run_child_body(const char *name) {
     if (strcmp(name, "env-garbage-enabled") == 0) return child_env_case("false", "env-garbage-enabled", 1);
     if (strcmp(name, "path-negative") == 0) return child_path_negative();
     if (strcmp(name, "nonmatch") == 0) return child_nonmatch();
+    if (strcmp(name, "guid-like") == 0) return child_guid_like();
+    if (strcmp(name, "guid-like-env-default") == 0) {
+        return child_guid_like_env_case(NULL, "guid-like-env-default", 0);
+    }
+    if (strcmp(name, "guid-like-env-one-disabled") == 0) {
+        return child_guid_like_env_case("1", "guid-like-env-one-disabled", 0);
+    }
+    if (strcmp(name, "guid-like-env-garbage-disabled") == 0) {
+        return child_guid_like_env_case("false", "guid-like-env-garbage-disabled", 0);
+    }
     if (strcmp(name, "tag-membership") == 0) return child_tag_membership();
     if (strcmp(name, "tag-row-parity") == 0) return child_tag_row_parity();
-    if (strcmp(name, "tag-env-default") == 0) return child_tag_env_case(NULL, "tag-env-default", 0);
+    if (strcmp(name, "tag-env-default") == 0) return child_tag_env_case(NULL, "tag-env-default", 1);
+    if (strcmp(name, "tag-env-zero-enabled") == 0) return child_tag_env_case("0", "tag-env-zero-enabled", 1);
     if (strcmp(name, "tag-env-one-disabled") == 0) return child_tag_env_case("1", "tag-env-one-disabled", 0);
-    if (strcmp(name, "tag-env-garbage-disabled") == 0) return child_tag_env_case("false", "tag-env-garbage-disabled", 0);
+    if (strcmp(name, "tag-env-garbage-enabled") == 0) return child_tag_env_case("false", "tag-env-garbage-enabled", 1);
     if (strcmp(name, "ondeck") == 0) return child_ondeck();
     if (strcmp(name, "ondeck-threshold") == 0) return child_ondeck_threshold();
     if (strcmp(name, "ondeck-threshold-fail-open") == 0) {
@@ -2124,6 +2812,9 @@ static int run_child_body(const char *name) {
     if (strcmp(name, "ondeck-env-garbage-disabled") == 0) return child_ondeck_env_case("false", "ondeck-env-garbage-disabled", 0);
     if (strcmp(name, "skip-log") == 0) return child_skip_log();
     if (strcmp(name, "tag-applied-log") == 0) return child_tag_applied_log();
+    if (strcmp(name, "guid-like-applied-sampling") == 0) {
+        return child_guid_like_applied_sampling();
+    }
     if (strcmp(name, "ondeck-capture-miss-log") == 0) return child_ondeck_capture_miss_log();
     if (strcmp(name, "tag-applied-sql-suppressed") == 0) return child_tag_applied_sql_suppressed();
     if (strcmp(name, "tag-index-log-dedup") == 0) return child_tag_index_log_dedup();
@@ -2155,6 +2846,8 @@ static void run_exec_child(const char *name) {
                 !safe_unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")) {
                 _exit(127);
             }
+        } else if (strcmp(name, "guid-like-applied-sampling") == 0) {
+            if (!configure_obs_guid_like_enabled_env()) _exit(127);
         } else if (strcmp(name, "tag-applied-log") == 0 ||
                    strcmp(name, "tag-applied-sql-suppressed") == 0 ||
                    strcmp(name, "tag-index-log-dedup") == 0) {
@@ -2190,11 +2883,16 @@ int main(int argc, char **argv) {
     run_child("env-garbage-enabled");
     run_child("path-negative");
     run_child("nonmatch");
+    run_child("guid-like");
+    run_child("guid-like-env-default");
+    run_child("guid-like-env-one-disabled");
+    run_child("guid-like-env-garbage-disabled");
     run_child("tag-membership");
     run_child("tag-row-parity");
     run_child("tag-env-default");
+    run_child("tag-env-zero-enabled");
     run_child("tag-env-one-disabled");
-    run_child("tag-env-garbage-disabled");
+    run_child("tag-env-garbage-enabled");
     run_child("ondeck");
     run_child("ondeck-threshold");
     run_child("ondeck-threshold-fail-open");
@@ -2203,12 +2901,14 @@ int main(int argc, char **argv) {
     run_child("ondeck-env-garbage-disabled");
     if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
         run_exec_child("skip-log");
+        run_exec_child("guid-like-applied-sampling");
         run_exec_child("tag-applied-log");
         run_exec_child("tag-applied-sql-suppressed");
         run_exec_child("tag-index-log-dedup");
         run_exec_child("ondeck-capture-miss-log");
     } else {
         printf("SKIP [skip-log]: ENABLE_ICU=0\n");
+        printf("SKIP [guid-like-applied-sampling]: ENABLE_ICU=0\n");
         printf("SKIP [tag-applied-log]: ENABLE_ICU=0\n");
         printf("SKIP [tag-applied-sql-suppressed]: ENABLE_ICU=0\n");
         printf("SKIP [tag-index-log-dedup]: ENABLE_ICU=0\n");

@@ -100,8 +100,21 @@ It proves:
   fails.
 - Rewrite-miss sampling observes the first shape before scheduling, emits
   first/new/every-1024th records, collapses GUID literals and same-type literal
-  list cardinality, preserves exact parameter-token forms, suppresses unknown
-  modes, and degrades to fewer records on lexer/set failure and the master gate.
+  list cardinality, preserves exact parameter-token forms, and degrades to
+  fewer records on lexer/set failure and the master gate.
+- Catalogue-derived, delimited
+  `event=rewrite_applied target=<target> mode=<mode> db=` matching covers all
+  14 registered modes. The A/A/B/B sequence proves count-1 correlation is
+  observed before schedule selection, and two fake connections prove applied
+  counters reset per connection.
+- Signed invalid ids suppress requested records without allocation,
+  clientdata, counter, or correlation work. The negative-first child keeps
+  allocator/clientdata failures armed through all invalid probes, calls
+  `reset_fault_state()` exactly once before valid probes, and asserts the sole
+  diagnostic needle
+  ` observability event=obs_mode_unregistered mode_id=-1 site=rewrite_applied`.
+  Separate children prove invalid-reason-first miss validation, master-disable
+  silence, and registered ineligible index suppression.
 
 ### `plex_fts_rewrite_smoke`
 
@@ -112,8 +125,10 @@ It proves:
 - ICU-only FTS rewrite enablement.
 - FTS opt-out env behavior: default-enabled, literal `1` disabled, non-`1`
   enabled, and exact-path negatives.
-- taggings and On-Deck opt-in env behavior: literal `0` enabled, unset,
+- GUID-LIKE and On-Deck opt-in env behavior: literal `0` enabled, unset,
   literal `1`, and non-`0` disabled.
+- taggings opt-out env behavior: unset, literal `0`, and non-`1` enabled;
+  literal `1` disabled.
 - On-Deck Variant B threshold rewriting with the common On-Deck opt-in enabled.
 - three UTF-8 prepare entries with `nByte`/NUL and `pzTail == NULL`.
 - quoted-string/`?` RHS.
@@ -123,29 +138,41 @@ It proves:
 - On-Deck Variant A id-list and Variant B literal-threshold exact-shape guards,
   section/account bind combinations, cross-product and invalid-threshold
   negatives, g2 index gate, duplicate ID preservation, fail-open paths, and
-  deterministic ranked-subquery output.
+  deterministic ranked-subquery output. The Variant A production form with
+  bare `library_section_id=?` has a raw/expected byte-exact emitted-SQL fixture
+  pair under `tests/fixtures/plex-fts-rewrite/`.
 - Full capture-miss source SQL, `sub_reason`, length/correlation fields,
   early-miss silence, the verbatim 1075-byte per-GUID `out_of_scope` fixture,
   near-miss fallback to `capture_miss`, distinct parameter-form shapes, hybrid
   `sample=first|periodic|new` applied records with full SQL fields, applied-SQL
   suppression, and process-global taggings `index_missing` sampling.
+- The Plex ICU image runs a real GUID-LIKE applied-sampling exec child against
+  two separately seeded target connections. Each performs 1025 prepares and
+  must return the rewritten SQL; the combined log has exactly two first and two
+  periodic `mode=guid+like-null` records, with no new or unscheduled counts.
+  The generic image prints an explicit `ENABLE_ICU=0` skip.
 - prepare-denial fail-open.
 - grouped-digest row identity.
+- `plex-fts-contract` full vendor/candidate membership and cardinality parity,
+  accepting only the exact `{10,11}` row-order permutation left unspecified by
+  the SQL's tied `count(*)` ordering.
 
 ### `emby_fts_rewrite_smoke`
 
 `tests/emby_fts_rewrite_smoke.c` runs in generic/Plex library Docker builds.
 The Dockerfile also builds `emby_fts_rewrite_direct_test` by linking the smoke
 directly with `src/emby_fts_rewrite.c`, `src/fts_lex.c`, and the pristine
-amalgamation.
+amalgamation. Its isolated direct-test block provides typed no-op miss,
+index-missing, applied, and skipped observability seams; `obs_logf` remains for
+the L1/L2 mismatch path.
 
 It proves:
 
 - FTS rewrite default-on behavior: unset, literal `0`, and garbage values
   enable; literal `1` disables.
-- FANOUT default-off behavior and enabled Browse-by-name, Favorites-first,
-  RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and
-  links-search rewrites.
+- FANOUT default-on behavior, literal-`1` opt-out, and enabled Browse-by-name,
+  Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios,
+  Type-29, and links-search rewrites.
 - DASHBOARD default-off behavior and literal-0 Episodes-Latest K1 plus guarded
   movies-Latest C2 behavior, list and one-parenthesis scalar ancestor forms,
   structural wide/compact projection preservation, movies `over` and
@@ -175,9 +202,12 @@ It proves:
   original SQL prepares.
 - fixture canaries under `tests/fixtures/emby-fts-rewrite/`.
 - ordered all-column type-tagged byte identity between separate non-target
-  vendor and indexed `library.db` candidate databases: K1 LIMIT 12/16/20,
-  guarded C2 36/36 literal cells plus expanded regimes in both stat states,
-  and separate 36/36 no-guard original-SQL/tail passthrough.
+  vendor and indexed `library.db` candidate databases for K1 LIMIT 12/16/20
+  and guarded C2 36/36 literal cells, plus separate 36/36 no-guard
+  original-SQL/tail passthrough. For guarded C2 expanded regimes in both stat
+  states, the vendor query executes and must return 20 rows; the candidate must
+  return the exact ID sequence `9001,9002,9003,9004,9005,9006,9007,9008,9009,9010,9119,9101,9104,9107,9111,9112,9113,9118,9116,9108`,
+  and every projected candidate cell must match that ID's fixture row.
 
 ### `config_after_dlopen_smoke`
 

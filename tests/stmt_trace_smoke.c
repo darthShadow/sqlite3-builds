@@ -33,12 +33,32 @@ struct fake_stmt {
     const char *sql;
 };
 
+struct rewrite_logger_case {
+    obs_rewrite_mode id;
+    const char *target;
+    const char *mode;
+};
+
+static const struct rewrite_logger_case g_rewrite_logger_cases[] = {
+#define OBS_REWRITE_LOGGER_CASE(suffix, target, mode, fn, eligible) \
+    { OBS_MODE_##suffix, target, mode },
+    OBS_REWRITE_MODE_CATALOG(OBS_REWRITE_LOGGER_CASE)
+#undef OBS_REWRITE_LOGGER_CASE
+};
+
+_Static_assert(
+    sizeof(g_rewrite_logger_cases) / sizeof(g_rewrite_logger_cases[0]) ==
+        OBS_MODE_COUNT - 1,
+    "rewrite logger case cardinality"
+);
+
 static unsigned g_trace_mask;
 static int (*g_trace_cb)(unsigned, void*, void*, void*);
 static unsigned g_trace_registrations;
 static int (*g_autoext_cb)(sqlite3*, char**, const sqlite3_api_routines*);
 static unsigned g_sqlite_malloc_calls;
 static unsigned g_sqlite_malloc_fail_call;
+static unsigned g_get_clientdata_calls;
 static unsigned g_set_clientdata_calls;
 static unsigned g_set_clientdata_fail_call;
 static int g_prepare_capture_miss;
@@ -185,9 +205,49 @@ static void require_occurrences(
     }
 }
 
+static int count_lines_containing(
+    const char *text,
+    const char *first,
+    const char *second
+) {
+    const char *line = text;
+    int count = 0;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        const char *first_match = strstr(line, first);
+        const char *second_match = strstr(line, second);
+        if (first_match && (!end || first_match < end) &&
+            second_match && (!end || second_match < end)) {
+            count++;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    return count;
+}
+
+static void require_line_occurrences(
+    const char *label,
+    const char *text,
+    const char *first,
+    const char *second,
+    int want
+) {
+    int got = count_lines_containing(text, first, second);
+    if (got != want) {
+        failf(
+            "FATAL: %s line occurrences=%d want=%d first=\"%s\" "
+            "second=\"%s\": %s",
+            label, got, want, first, second, text
+        );
+    }
+}
+
 static void reset_fault_state(void) {
     g_sqlite_malloc_calls = 0;
     g_sqlite_malloc_fail_call = 0;
+    g_get_clientdata_calls = 0;
     g_set_clientdata_calls = 0;
     g_set_clientdata_fail_call = 0;
     g_creation_race_gets = 0;
@@ -331,7 +391,7 @@ static int child_capture_miss(int fail_alloc) {
 }
 
 static void log_test_rewrite_miss(
-    const char *mode,
+    obs_rewrite_mode mode,
     obs_miss_reason reason,
     const char *sub_reason,
     const char *sql
@@ -341,7 +401,7 @@ static void log_test_rewrite_miss(
 
     if (!obs_is_disabled()) shape = fts_lex_shape_key(sql, len);
     obs_log_rewrite_miss(
-        "emby", mode, reason, sub_reason, NULL, sql, len, shape
+        mode, reason, sub_reason, NULL, sql, len, shape
     );
 }
 
@@ -353,7 +413,7 @@ static int child_miss_sampling(void) {
     for (i = 1u; i <= 1025u; i++) {
         const char *sql = (i == 2u || i == 3u) ? sql_b : sql_a;
         log_test_rewrite_miss(
-            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+            OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection", sql
         );
     }
     return 0;
@@ -373,7 +433,7 @@ static int child_miss_guid_dedup(void) {
             failf("FATAL: GUID miss SQL overflow");
         }
         log_test_rewrite_miss(
-            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+            OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection", sql
         );
     }
     return 0;
@@ -384,10 +444,10 @@ static int child_miss_list_dedup(void) {
     static const char list_three[] = "SELECT id FROM items WHERE id IN (1,2,3)";
 
     log_test_rewrite_miss(
-        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", list_two
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection", list_two
     );
     log_test_rewrite_miss(
-        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", list_three
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection", list_three
     );
     return 0;
 }
@@ -404,12 +464,12 @@ static int child_miss_shape_cap(void) {
             failf("FATAL: shape-cap SQL overflow");
         }
         log_test_rewrite_miss(
-            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+            OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection", sql
         );
     }
     for (i = 513u; i < 1024u; i++) {
         log_test_rewrite_miss(
-            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+            OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection",
             "SELECT column_0 FROM table_0"
         );
     }
@@ -418,11 +478,11 @@ static int child_miss_shape_cap(void) {
 
 static int child_miss_lexer_error(void) {
     log_test_rewrite_miss(
-        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection",
         "SELECT 'unterminated_a"
     );
     log_test_rewrite_miss(
-        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "projection",
         "SELECT /* unterminated_b"
     );
     return 0;
@@ -430,8 +490,223 @@ static int child_miss_lexer_error(void) {
 
 static int child_miss_unknown_mode(void) {
     log_test_rewrite_miss(
-        "unknown-mode", OBS_MISS_CAPTURE, "projection", "SELECT unknown_mode"
+        OBS_MODE_NONE, OBS_MISS_CAPTURE, "projection", "SELECT unknown_mode"
     );
+    return 0;
+}
+
+static int child_applied_sampler_all_modes(void) {
+    static const char source_a[] = "SELECT all_modes_source_a";
+    static const char rewritten_a[] = "SELECT all_modes_rewritten_a";
+    static const char source_b[] = "SELECT all_modes_source_b";
+    static const char rewritten_b[] = "SELECT all_modes_rewritten_b";
+    size_t mode_index;
+
+    reset_fault_state();
+    for (mode_index = 0;
+         mode_index < sizeof(g_rewrite_logger_cases) /
+             sizeof(g_rewrite_logger_cases[0]);
+         mode_index++) {
+        struct fake_db db = { .filename = "/tmp/applied-all-modes-smoke.db" };
+        unsigned i;
+
+        for (i = 1u; i <= 1025u; i++) {
+            const char *source = (i == 3u || i == 4u) ? source_b : source_a;
+            const char *rewritten =
+                (i == 3u || i == 4u) ? rewritten_b : rewritten_a;
+            obs_log_rewrite_applied(
+                g_rewrite_logger_cases[mode_index].id,
+                (sqlite3 *)&db,
+                source,
+                strlen(source),
+                rewritten,
+                strlen(rewritten)
+            );
+        }
+        free_fake_clientdata(&db);
+    }
+    return 0;
+}
+
+static int child_applied_sampler_per_connection(void) {
+    static const char source[] = "SELECT per_connection_source";
+    static const char rewritten[] = "SELECT per_connection_rewritten";
+    struct fake_db db_a = { .filename = "/tmp/applied-per-connection-a.db" };
+    struct fake_db db_b = { .filename = "/tmp/applied-per-connection-b.db" };
+
+    reset_fault_state();
+    obs_log_rewrite_applied(
+        OBS_MODE_EMBY_BROWSE, (sqlite3 *)&db_a,
+        source, strlen(source), rewritten, strlen(rewritten)
+    );
+    obs_log_rewrite_applied(
+        OBS_MODE_EMBY_BROWSE, (sqlite3 *)&db_a,
+        source, strlen(source), rewritten, strlen(rewritten)
+    );
+    obs_log_rewrite_applied(
+        OBS_MODE_EMBY_BROWSE, (sqlite3 *)&db_b,
+        source, strlen(source), rewritten, strlen(rewritten)
+    );
+    free_fake_clientdata(&db_a);
+    free_fake_clientdata(&db_b);
+    return 0;
+}
+
+enum invalid_mode_api {
+    INVALID_MODE_APPLIED = 0,
+    INVALID_MODE_MISS,
+    INVALID_MODE_INDEX_MISSING,
+    INVALID_MODE_SKIPPED
+};
+
+static void call_invalid_mode_api(
+    struct fake_db *db,
+    enum invalid_mode_api api,
+    obs_rewrite_mode mode
+) {
+    static const char source[] = "SELECT invalid_mode_source";
+    static const char rewritten[] = "SELECT invalid_mode_rewritten";
+    static const char miss_sql[] = "SELECT invalid_mode_shape";
+
+    if (api == INVALID_MODE_APPLIED) {
+        obs_log_rewrite_applied(
+            mode, (sqlite3 *)db,
+            source, strlen(source), rewritten, strlen(rewritten)
+        );
+    } else if (api == INVALID_MODE_MISS) {
+        obs_log_rewrite_miss(
+            mode, OBS_MISS_CAPTURE, "invalid_mode", (sqlite3 *)db,
+            miss_sql, strlen(miss_sql),
+            fts_lex_shape_key(miss_sql, strlen(miss_sql))
+        );
+    } else if (api == INVALID_MODE_INDEX_MISSING) {
+        obs_log_index_missing((sqlite3 *)db, mode);
+    } else {
+        obs_log_rewrite_skipped((sqlite3 *)db, "invalid_mode", mode);
+    }
+}
+
+static void require_invalid_mode_no_work(
+    struct fake_db *db,
+    enum invalid_mode_api api,
+    obs_rewrite_mode mode
+) {
+    struct fake_clientdata before[FAKE_CLIENTDATA_SLOTS];
+    unsigned malloc_before = g_sqlite_malloc_calls;
+    unsigned get_before = g_get_clientdata_calls;
+    unsigned set_before = g_set_clientdata_calls;
+
+    memcpy(before, db->clientdata, sizeof(before));
+    call_invalid_mode_api(db, api, mode);
+    if (g_sqlite_malloc_calls != malloc_before ||
+        g_get_clientdata_calls != get_before ||
+        g_set_clientdata_calls != set_before) {
+        failf(
+            "FATAL: invalid mode api=%d mode=%d boundary delta malloc=%u "
+            "get=%u set=%u",
+            (int)api, (int)mode,
+            g_sqlite_malloc_calls - malloc_before,
+            g_get_clientdata_calls - get_before,
+            g_set_clientdata_calls - set_before
+        );
+    }
+    if (memcmp(before, db->clientdata, sizeof(before)) != 0) {
+        failf(
+            "FATAL: invalid mode api=%d mode=%d changed clientdata",
+            (int)api, (int)mode
+        );
+    }
+}
+
+static int child_applied_unregistered_negative_first(void) {
+    static const obs_rewrite_mode invalid_modes[] = {
+        (obs_rewrite_mode)-1, OBS_MODE_NONE, OBS_MODE_COUNT
+    };
+    static const char applied_source[] = "SELECT valid_applied_source";
+    static const char applied_rewritten[] = "SELECT valid_applied_rewritten";
+    static const char miss_a[] = "SELECT valid_mode_shape";
+    static const char miss_b[] = "SELECT invalid_mode_shape";
+    struct fake_db db = { .filename = "/tmp/unregistered-negative-first.db" };
+    size_t mode_index;
+    int api;
+
+    reset_fault_state();
+    g_sqlite_malloc_fail_call = 1u;
+    g_set_clientdata_fail_call = 1u;
+    require_invalid_mode_no_work(
+        &db, INVALID_MODE_APPLIED, (obs_rewrite_mode)-1
+    );
+    for (mode_index = 0;
+         mode_index < sizeof(invalid_modes) / sizeof(invalid_modes[0]);
+         mode_index++) {
+        for (api = INVALID_MODE_APPLIED; api <= INVALID_MODE_SKIPPED; api++) {
+            require_invalid_mode_no_work(
+                &db, (enum invalid_mode_api)api, invalid_modes[mode_index]
+            );
+        }
+    }
+    if (g_sqlite_malloc_fail_call != 1u ||
+        g_set_clientdata_fail_call != 1u) {
+        failf("FATAL: invalid mode calls changed armed fail ordinals");
+    }
+
+    reset_fault_state();
+
+    obs_log_rewrite_applied(
+        OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
+        applied_source, strlen(applied_source),
+        applied_rewritten, strlen(applied_rewritten)
+    );
+    obs_log_rewrite_miss(
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "valid_a",
+        (sqlite3 *)&db, miss_a, strlen(miss_a),
+        fts_lex_shape_key(miss_a, strlen(miss_a))
+    );
+    obs_log_rewrite_miss(
+        OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE, "invalid_mode",
+        (sqlite3 *)&db, miss_b, strlen(miss_b),
+        fts_lex_shape_key(miss_b, strlen(miss_b))
+    );
+    obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_EPISODES_LATEST);
+    free_fake_clientdata(&db);
+    return 0;
+}
+
+static int child_unregistered_disabled(void) {
+    struct fake_db db = { .filename = "/tmp/unregistered-disabled.db" };
+
+    reset_fault_state();
+    g_sqlite_malloc_fail_call = 1u;
+    g_set_clientdata_fail_call = 1u;
+    require_invalid_mode_no_work(
+        &db, INVALID_MODE_APPLIED, (obs_rewrite_mode)-1
+    );
+    return 0;
+}
+
+static int child_miss_validation_order(void) {
+    static const char sql[] = "SELECT invalid_reason";
+    struct fake_db db = { .filename = "/tmp/miss-validation-order.db" };
+
+    obs_log_rewrite_miss(
+        OBS_MODE_NONE, (obs_miss_reason)-1, "invalid_reason", (sqlite3 *)&db,
+        sql, strlen(sql), 1u
+    );
+    obs_log_rewrite_applied(
+        OBS_MODE_NONE, (sqlite3 *)&db,
+        sql, strlen(sql), sql, strlen(sql)
+    );
+    return 0;
+}
+
+static int child_index_missing_ineligible(void) {
+    struct fake_db db = { .filename = "/tmp/index-missing-ineligible.db" };
+    unsigned i;
+
+    for (i = 0u; i < 1025u; i++) {
+        obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_BROWSE);
+    }
+    obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_EPISODES_LATEST);
     return 0;
 }
 
@@ -448,7 +723,7 @@ static int child_applied_sampling(void) {
         const char *source = (i == 2u || i == 3u) ? source_b : source_a;
         const char *rewritten = (i == 2u || i == 3u) ? rewritten_b : rewritten_a;
         obs_log_rewrite_applied(
-            "emby", "dashboard+episodes_latest", (sqlite3 *)&db,
+            OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
             source, strlen(source), rewritten, strlen(rewritten)
         );
     }
@@ -467,13 +742,13 @@ static int child_applied_corr_cap(void) {
         snprintf(source, sizeof(source), "SELECT source_%u", i);
         snprintf(rewritten, sizeof(rewritten), "SELECT rewritten_%u", i);
         obs_log_rewrite_applied(
-            "emby", "dashboard+episodes_latest", (sqlite3 *)&db,
+            OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
             source, strlen(source), rewritten, strlen(rewritten)
         );
     }
     for (i = 513u; i < 1024u; i++) {
         obs_log_rewrite_applied(
-            "emby", "dashboard+episodes_latest", (sqlite3 *)&db,
+            OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
             "SELECT source_0", strlen("SELECT source_0"),
             "SELECT rewritten_0", strlen("SELECT rewritten_0")
         );
@@ -494,7 +769,7 @@ static int child_applied_corr_failure(int fail_clientdata) {
     }
     for (i = 0; i < 1024u; i++) {
         obs_log_rewrite_applied(
-            "emby", "dashboard+episodes_latest", (sqlite3 *)&db,
+            OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
             "SELECT failure_source", strlen("SELECT failure_source"),
             "SELECT failure_rewritten", strlen("SELECT failure_rewritten")
         );
@@ -535,7 +810,7 @@ static int child_connection_state_failure(int stmt_stream, int fail_clientdata) 
             obs_trace_stmt_cb(SQLITE_TRACE_STMT, NULL, &stmt, (void *)source);
         } else {
             obs_log_rewrite_applied(
-                "emby", "dashboard+episodes_latest", (sqlite3 *)&db,
+                OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)&db,
                 source, strlen(source), rewritten, strlen(rewritten)
             );
         }
@@ -553,7 +828,7 @@ struct creation_race_arg {
 static void *connection_creation_race_thread(void *arg) {
     struct creation_race_arg *race = (struct creation_race_arg *)arg;
     obs_log_rewrite_applied(
-        "emby", "dashboard+episodes_latest", (sqlite3 *)race->db,
+        OBS_MODE_EMBY_EPISODES_LATEST, (sqlite3 *)race->db,
         race->source, strlen(race->source),
         race->rewritten, strlen(race->rewritten)
     );
@@ -703,7 +978,7 @@ int emby_fts_rewrite_prepare(
 
         if (!obs_is_disabled()) shape = fts_lex_shape_key(zSql, scan_len);
         obs_log_rewrite_miss(
-            "emby", "dashboard+episodes_latest", OBS_MISS_CAPTURE,
+            OBS_MODE_EMBY_EPISODES_LATEST, OBS_MISS_CAPTURE,
             "projection", db, zSql, scan_len, shape
         );
     }
@@ -803,6 +1078,7 @@ void *sqlite3_get_clientdata(sqlite3 *db, const char *key) {
     unsigned i;
     if (!fake || !key) return NULL;
     pthread_mutex_lock(&g_fake_clientdata_mutex);
+    g_get_clientdata_calls++;
     for (i = 0; i < FAKE_CLIENTDATA_SLOTS; i++) {
         if (fake->clientdata[i].key &&
             strcmp(fake->clientdata[i].key, key) == 0) {
@@ -941,6 +1217,26 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "child-miss-unknown-mode") == 0) {
         return child_miss_unknown_mode();
     }
+    if (argc == 2 && strcmp(argv[1], "child-applied-sampler-all-modes") == 0) {
+        return child_applied_sampler_all_modes();
+    }
+    if (argc == 2 &&
+        strcmp(argv[1], "child-applied-sampler-per-connection") == 0) {
+        return child_applied_sampler_per_connection();
+    }
+    if (argc == 2 &&
+        strcmp(argv[1], "child-applied-unregistered-negative-first") == 0) {
+        return child_applied_unregistered_negative_first();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-unregistered-disabled") == 0) {
+        return child_unregistered_disabled();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-validation-order") == 0) {
+        return child_miss_validation_order();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-index-missing-ineligible") == 0) {
+        return child_index_missing_ineligible();
+    }
     if (argc == 2 && strcmp(argv[1], "child-applied-sampling") == 0) {
         return child_applied_sampling();
     }
@@ -1063,6 +1359,144 @@ int main(int argc, char **argv) {
 
     out = run_child_capture(argv[0], "child-miss-unknown-mode", env_default);
     require_absent("miss unknown mode suppresses", out, "event=rewrite_skipped");
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-applied-sampler-all-modes", env_default
+    );
+    {
+        size_t mode_index;
+        for (mode_index = 0;
+             mode_index < sizeof(g_rewrite_logger_cases) /
+                 sizeof(g_rewrite_logger_cases[0]);
+             mode_index++) {
+            char label[128];
+            char needle[192];
+            int rc = snprintf(
+                needle, sizeof(needle),
+                "event=rewrite_applied target=%s mode=%s db=",
+                g_rewrite_logger_cases[mode_index].target,
+                g_rewrite_logger_cases[mode_index].mode
+            );
+            if (rc < 0 || (size_t)rc >= sizeof(needle)) {
+                failf("FATAL: all-mode applied needle overflow");
+            }
+            rc = snprintf(
+                label, sizeof(label), "all-mode applied %s",
+                g_rewrite_logger_cases[mode_index].mode
+            );
+            if (rc < 0 || (size_t)rc >= sizeof(label)) {
+                failf("FATAL: all-mode applied label overflow");
+            }
+            require_occurrences(label, out, needle, 3);
+            require_line_occurrences(
+                label, out, needle, "sample=first count=1", 1
+            );
+            require_line_occurrences(
+                label, out, needle, "sample=new count=3", 1
+            );
+            require_line_occurrences(
+                label, out, needle, "sample=periodic count=1024", 1
+            );
+            require_line_occurrences(
+                label, out, needle, "sample=new count=2", 0
+            );
+            require_line_occurrences(
+                label, out, needle, "sample=new count=4", 0
+            );
+            require_line_occurrences(label, out, needle, "count=1025", 0);
+        }
+    }
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-applied-sampler-per-connection", env_default
+    );
+    require_occurrences(
+        "applied per-connection records", out,
+        "event=rewrite_applied target=emby mode=fanout+browse db=", 2
+    );
+    require_occurrences(
+        "applied per-connection first counts", out, "sample=first count=1", 2
+    );
+    require_absent("applied per-connection second count", out, "count=2");
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-applied-unregistered-negative-first", env_default
+    );
+    require_occurrences(
+        "unregistered mode one-shot", out, "event=obs_mode_unregistered", 1
+    );
+    require_occurrences(
+        "unregistered negative-first exact needle", out,
+        " observability event=obs_mode_unregistered mode_id=-1 "
+        "site=rewrite_applied",
+        1
+    );
+    require_absent("unregistered mode no fn field", out, "fn=observability");
+    require_absent("unregistered mode signed decimal", out, "4294967295");
+    require_absent("unregistered applied suppressed", out, "invalid_mode_source");
+    require_contains(
+        "valid applied probe starts at one", out,
+        "event=rewrite_applied target=emby "
+        "mode=dashboard+episodes_latest db="
+    );
+    require_contains("valid applied probe first", out, "sample=first count=1");
+    require_same_line(
+        "valid miss probe first", out, "reason=capture_miss",
+        "sub_reason=valid_a"
+    );
+    require_same_line(
+        "valid miss probe preserves invalid-phase shape", out,
+        "sub_reason=invalid_mode", "sample=new count=2"
+    );
+    require_same_line(
+        "valid index probe first", out, "reason=index_missing",
+        "sample=first count=1"
+    );
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-unregistered-disabled", env_obs_disabled
+    );
+    require_absent(
+        "disabled unregistered diagnostic", out, "obs_mode_unregistered"
+    );
+    require_absent("disabled unregistered requested record", out, "rewrite_");
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-miss-validation-order", env_default
+    );
+    require_occurrences(
+        "miss validation order one-shot", out, "event=obs_mode_unregistered", 1
+    );
+    require_occurrences(
+        "miss validation order applied site", out,
+        " observability event=obs_mode_unregistered mode_id=0 "
+        "site=rewrite_applied",
+        1
+    );
+    require_absent("miss validation order miss site", out, "site=rewrite_miss");
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-index-missing-ineligible", env_default
+    );
+    require_absent(
+        "registered ineligible index mode", out,
+        "reason=index_missing mode=fanout+browse db="
+    );
+    require_occurrences(
+        "eligible index mode starts at one", out,
+        "reason=index_missing mode=dashboard+episodes_latest db=", 1
+    );
+    require_contains("eligible index mode first", out, "sample=first count=1");
+    require_absent(
+        "registered ineligible is not unregistered", out,
+        "obs_mode_unregistered"
+    );
     free(out);
 
     out = run_child_capture(argv[0], "child-default", env_default);

@@ -207,9 +207,10 @@ milestone lands.
   must prepare the original SQL unchanged, while enabled Emby matches
   intentionally prepare scalar-plus-membership, fan-out, or dashboard Latest
   rewrites and enabled Plex matches intentionally prepare the
-  `unlikely(tag_type=<value>)`, taggings-membership conjunct, or On-Deck
-  ranked-subquery rewrite. Rewrite-success logging is emitted only after the
-  rewritten statement is the returned statement. Applied records combine
+  `unlikely(tag_type=<value>)`, GUID-LIKE NULL-guard, taggings-membership
+  conjunct, or On-Deck ranked-subquery rewrite. Rewrite-success logging is
+  emitted only after the rewritten statement is the returned statement.
+  Applied records combine
   per-connection/per-mode first-and-every-1024th sampling with a bounded
   per-connection first-seen-`corr` set. Full emitted records use
   `sample=first`, `sample=periodic`, or `sample=new`; a full or unavailable set
@@ -220,7 +221,20 @@ milestone lands.
   first/every-1024th counters plus one bounded process-global first-seen
   structural-shape set. The caller gates and computes the lexer shape; this
   file gains no lexer dependency. Every event, including count 1, is observed
-  before schedule selection. Unknown modes suppress. Emitted miss records
+  before schedule selection. `src/rewrite_modes.h` is the only rewrite-mode
+  catalogue. Producers pass signed `OBS_MODE_*` ids. Applied, miss, and
+  index-missing counters share the `OBS_MODE_COUNT` index space while applied
+  counters remain per connection and miss plus index-missing counters remain
+  process-global. Invalid numeric mode ids suppress the requested mode-bearing
+  record. When observability is enabled, the first invalid id across all
+  mode-bearing APIs emits one process-wide record with positional logger label
+  `observability` followed by payload
+  `event=obs_mode_unregistered mode_id=<signed-decimal> site=<site>`; later
+  invalid ids suppress silently. The negative-first applied example contains
+  the exact substring
+  ` observability event=obs_mode_unregistered mode_id=-1 site=rewrite_applied`.
+  Registered index-ineligible ids suppress index-missing records without
+  emitting that diagnostic. Emitted miss records
   allocate and carry full uncapped raw source SQL, first-failure `sub_reason`,
   `sample`, process-global `count`, structural `shape`, exact length, and
   full-span correlation; allocation or record-size failure emits a bounded
@@ -291,7 +305,7 @@ milestone lands.
   Plex taggings/On-Deck and Emby Episodes/movies Latest. Count 1 and every
   1024th occurrence emit; all others suppress across database handles. Probe
   errors stay unsuppressed. Missing-index logging has no clientdata allocation
-  dependency.
+  dependency. Only those four catalogue rows are index-missing eligible.
 - Full `capture_miss` and `out_of_scope` records allocate and format outside the stderr stream
   lock, then emit one `fwrite()` plus one terminal newline; failure to build the
   full record falls back to `obs_logf` and never affects prepare behavior.
@@ -358,11 +372,15 @@ milestone lands.
   and runtime optimize.
 - Plex FTS rewrite is opt-out in the Plex/ICU build: literal
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
-  other value enable. Plex taggings and On-Deck rewrites are opt-in:
-  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=0` and
-  `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enable; unset, literal `1`, and every
-  other value disable. These Plex opt-in rewrites fail open and are independent
-  of `SQLITE3_DISABLE_AUTOPRAGMA` and `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+  other value enable. The Plex GUID-LIKE rewrite is opt-in:
+  `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE=0` enables; unset, literal `1`, and
+  every other value disable. The Plex taggings rewrite is opt-out and
+  default-on: `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=1` disables; unset,
+  literal `0`, and every other value enable. The Plex On-Deck rewrite is
+  opt-in: `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enables; unset, literal `1`,
+  and every other value disable. These Plex rewrites fail open and are
+  independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
   The On-Deck id-list and threshold arms both run whenever the base On-Deck
   rewrite is enabled.
 - Literal `SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` omits source and rewritten
@@ -372,10 +390,11 @@ milestone lands.
   `SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1` logs every enabled STMT callback;
   unset, literal `0`, and every other value retain hybrid first/periodic/new
   sampling. The sampling override never enables STMT trace.
-- Emby FTS rewrite is opt-out: literal `SQLITE3_DISABLE_EMBY_FTS_REWRITE=1`
-  disables; unset, literal `0`, and every other value enable. Emby fan-out and
-  dashboard rewrites are opt-in: `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` and
-  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enable; unset, literal `1`, and
+- Emby FTS and fan-out rewrites are opt-out and default-on: literal `1` in
+  `SQLITE3_DISABLE_EMBY_FTS_REWRITE` or
+  `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` disables that family; unset, literal
+  `0`, and every other value enable. The Emby dashboard rewrite is opt-in:
+  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables; unset, literal `1`, and
   every other value disable. These Emby rewrites fail open and are independent
   of `SQLITE3_DISABLE_AUTOPRAGMA`.
 - Runtime optimize has two successful per-path cadences: LIMITED defaults to
@@ -450,7 +469,7 @@ milestone lands.
   `github.repository == 'darthshadow/sqlite3-builds'`) and same-repository pull
   requests. `CACHE_EVENT_NAME` maps pull requests to `pr-<number>` and every
   non-pull-request event to `baseline`.
-- `docker-library/Dockerfile` keeps all 18 project `COPY` lines after the ICU
+- `docker-library/Dockerfile` keeps all 19 project `COPY` lines after the ICU
   and mimalloc dependency layers, after
   `ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a`.
 - Workflow `concurrency` keys pull requests by PR number and other runs by
