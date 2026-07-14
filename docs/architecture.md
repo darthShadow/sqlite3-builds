@@ -65,14 +65,15 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/fixtures/emby-fts-rewrite/` | Raw Emby search statement fixtures and expected prepare-wrapper output for smoke and manual host-gate checks. |
 | `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: schema v3 metadata, detector, artifact, pre, Plex pool-site, unsupported rows, and malformed-input rejection. |
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
-| `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for minimal release assets and split `mod-build` / `mod-publish` jobs. |
+| `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for the `preflight` / `build-cli` / `build-generic` / `build-plex` job split and producer-owned smokes, minimal release assets, rendered release-notes wiring, and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
-| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults, and checks SORTERREF/PMASZ compile defaults against constructor runtime config values. |
+| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults and SORTERREF/PMASZ compile/runtime alignment, enforces six `Load version pins` steps, and enforces workflow concurrency, the GHCR registry build-cache contract (`type=gha` forbidden; `CACHE_EXPORT_ENABLED`-gated event-ref-only exports), and all 18 project `COPY` lines after the ICU and mimalloc dependency layers. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled and run in library images without failing the build. |
 | `tests/runtime_optimize_close_bench.c` | Advisory runtime optimize hook microbench for close-adjacent inline exits, compiled and run for the generic library variant on every build without failing the build. |
 | `build/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
 | `tools/lsio-mod/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
 | `tools/lsio-mod/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
+| `tools/ci/render-release-notes.sh` | Renders the oldest-first non-merge commit-subject section appended to the CalVer release body. |
 | `tools/ci/emby-fts-rewrite-dump.c` | Manual host-gate utility that prepares an Emby fixture through the wrapper and writes `sqlite3_sql(stmt)` output; it has no CI consumer. |
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
 | `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |

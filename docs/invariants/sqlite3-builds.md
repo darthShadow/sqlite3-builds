@@ -428,13 +428,33 @@ milestone lands.
 
 ## 5. Workflow
 
-- Matrix `fail-fast: false` in
+- Matrix `fail-fast: false` in every
   `.github/workflows/sqlite-build.yml` strategy block.
 - Smoke-step positive-mode marker assertions opt in with
   `SQLITE3_DISABLE_STMT_TRACE=0`: aggregate count guard
   `sqlite3_open(_v2|16)?` AND `SQLITE_TRACE_STMT`. Do NOT assert
   `sqlite3_initialize` marker emission.
 - `release` publishes `sqlite-<tag>-*.tar.gz` and `SHA256SUMS`.
+- `release` is tag-gated and depends on `build-cli`, `build-generic`,
+  `build-plex`, and `mod-static-tests`.
+- Release-note wiring checks out full history with `fetch-depth: 0`, invokes
+  `bash tools/ci/render-release-notes.sh "${GITHUB_REF_NAME}" "${RELEASE_NOTES_DELIMITER}"`,
+  writes the `changes` output through `printf 'changes<<%s\n'` with delimiter
+  `EOF_RELEASE_NOTES_CHANGES`, and places the compatibility content in inline
+  `body:`; `body_path:` is forbidden.
+- Buildx layer cache uses GHCR `type=registry` only; `type=gha` is forbidden.
+  Imports read `<scope>-<event>` and then `<scope>-baseline`. Exports write the
+  event ref only and use `continue-on-error: true`. `CACHE_EXPORT_ENABLED`
+  enables exports only for canonical `main` pushes
+  (`github.ref == 'refs/heads/main'` and
+  `github.repository == 'darthshadow/sqlite3-builds'`) and same-repository pull
+  requests. `CACHE_EVENT_NAME` maps pull requests to `pr-<number>` and every
+  non-pull-request event to `baseline`.
+- `docker-library/Dockerfile` keeps all 18 project `COPY` lines after the ICU
+  and mimalloc dependency layers, after
+  `ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a`.
+- Workflow `concurrency` keys pull requests by PR number and other runs by
+  `github.ref`, and cancels in-progress runs except `refs/tags/`.
 - `mod-build` builds and smokes run-scoped temporary tags only.
 - `mod-publish` is tag-gated, depends on `release` and `mod-build`, and is
   the only job that pushes stable mod tags or multi-arch manifests.

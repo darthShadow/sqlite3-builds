@@ -118,8 +118,9 @@ per compat group and arch. Current compat groups are data rows in
 the accepted mod/group pairs (`manifest-parser.sh:73-85`). The workflow also
 derives the build stems from the first compat group per mod, so adding a second
 same-mod group is a code and workflow change in the current implementation
-(`.github/workflows/sqlite-build.yml:77-106`,
-`tests/check_multi_version_pin_alignment.sh:285-293`).
+(`.github/workflows/sqlite-build.yml`, step `Load library artifact stems`;
+`tests/check_multi_version_pin_alignment.sh`, exact Emby/Plex upload-artifact
+`require_line` assertions).
 
 For Plex ICU runtime SHAs, enforcement is per `(compat_group, arch, soname)`, not
 group-global. Renderer input accepts `icu-runtime` baseline rows, ignores rows
@@ -184,8 +185,8 @@ review counting deduplicates by reviewer and requires `review_count >= 2`
 (`render-lsio-mod-baked-pins.sh:475-480`,
 `render-lsio-mod-baked-pins.sh:522-524`). The multi-version alignment test
 independently enforces approved status and fewer-than-two review rejection
-(`tests/check_multi_version_pin_alignment.sh:236-247`,
-`tests/check_multi_version_pin_alignment.sh:272-275`).
+(`tests/check_multi_version_pin_alignment.sh:286-297`,
+`tests/check_multi_version_pin_alignment.sh:327-330`).
 
 ## Retired Scalar Pins
 
@@ -216,7 +217,8 @@ and confines the `-` sentinel to that field; it does not validate digest syntax
 (`manifest-parser.sh:469-475`, `manifest-parser.sh:590-596`). CI records resolved
 repo digests for supported images in a `support-image-digests-<mod>-<arch_suffix>`
 artifact by pulling each `image_ref` and writing `image-digests.tsv`
-(`.github/workflows/sqlite-build.yml:455-482`). Bake-smoke also pulls the image,
+(`.github/workflows/sqlite-build.yml`, step `Record support image digests`).
+Bake-smoke also pulls the image,
 extracts `RepoDigests`, and injects that digest into pre fragments used for
 rendering (`tools/ci/mod-bake-smoke.sh:131-161`).
 
@@ -253,7 +255,7 @@ The renderer accepts only those values (`render-lsio-mod-baked-pins.sh:81-85`).
 Only `supported` rows are rendered into the mod support window; all other status
 values are ignored by the renderer (`render-lsio-mod-baked-pins.sh:203-232`).
 The workflow digest-recording path also filters to supported rows only
-(`.github/workflows/sqlite-build.yml:462-466`).
+(`.github/workflows/sqlite-build.yml`, step `Record support image digests`).
 
 Operational meanings:
 

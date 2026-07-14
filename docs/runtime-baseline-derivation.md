@@ -14,6 +14,11 @@ This covers:
 - Emby `detect` rows for `emby_deps` and `emby_dll`.
 - `pre target_sqlite` rows for Plex and Emby.
 - Plex `pre plex_icu_linked:<soname>` rows and matching `icu-runtime` rows.
+- `pins/emby-detector-evidence.tsv` rows mirroring every Emby `detect` and
+  `pre target_sqlite` baseline tuple, with `image_ref` from
+  `pins/runtime-support.tsv`, `file_path` and `sha256` from
+  `pins/runtime-baselines.tsv`, and `source` set to
+  `pins/runtime-baselines.tsv`.
 
 Arch mapping:
 
@@ -46,7 +51,7 @@ Copy the published image into a fresh dir transport:
 
 ```bash
 copy_dir="$(mktemp -d)"
-image_ref='lscr.io/linuxserver/plex:1.43.2'
+image_ref='ghcr.io/linuxserver/plex:1.43.2'
 skopeo_arch='amd64'
 
 skopeo copy \

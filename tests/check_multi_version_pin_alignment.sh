@@ -58,6 +58,7 @@ for file in \
   pins/runtime-support.tsv \
   pins/library-compat-groups.tsv \
   pins/runtime-baselines.tsv \
+  pins/emby-detector-evidence.tsv \
   pins/plex-pool-patch-sites.tsv \
   pins/plex-pool-patch-reviews.tsv \
   .github/workflows/sqlite-build.yml \
@@ -70,6 +71,7 @@ awk -F '\t' \
   -v compat_file="pins/library-compat-groups.tsv" \
   -v support_file="pins/runtime-support.tsv" \
   -v baseline_file="pins/runtime-baselines.tsv" \
+  -v emby_evidence_file="pins/emby-detector-evidence.tsv" \
   -v pool_sites_file="pins/plex-pool-patch-sites.tsv" \
   -v pool_reviews_file="pins/plex-pool-patch-reviews.tsv" '
   function die(message) {
@@ -126,6 +128,9 @@ awk -F '\t' \
     if (!valid_mod($1)) {
       die("invalid runtime support mod at line " FNR ": " $1)
     }
+    if ($5 == "supported" && $3 !~ ("^ghcr[.]io/linuxserver/" $1 ":")) {
+      die("supported runtime image_ref must use canonical GHCR repository at line " FNR ": " $3)
+    }
     if (!($4 in compat_mod)) {
       die("runtime support references unknown compat_group at line " FNR ": " $4)
     }
@@ -159,6 +164,9 @@ awk -F '\t' \
       if ($2 != server_mod[$3]) {
         die("runtime baseline mod mismatch at line " FNR ": " $2)
       }
+      if ($1 == "pre" && $6 !~ ("^ghcr[.]io/linuxserver/" $2 ":")) {
+        die("runtime baseline image_ref must use canonical GHCR repository at line " FNR ": " $6)
+      }
       if ($1 == "pre" && $6 != server_image[$3]) {
         die("runtime baseline image_ref mismatch at line " FNR ": " $3)
       }
@@ -168,6 +176,14 @@ awk -F '\t' \
       }
       if ($1 == "detect" && $5 ~ /:pristine$/) {
         pristine_sha[$3 SUBSEP $4 SUBSEP $8] = $12
+      }
+      if ($2 == "emby") {
+        evidence_key = $2 SUBSEP $3 SUBSEP $4 SUBSEP $1 SUBSEP $5
+        if (evidence_key in baseline_evidence_path) {
+          die("duplicate Emby evidence source tuple at line " FNR ": " $3 " " $4 " " $1 " " $5)
+        }
+        baseline_evidence_path[evidence_key] = $8
+        baseline_evidence_sha[evidence_key] = $12
       }
       next
     }
@@ -181,6 +197,40 @@ awk -F '\t' \
       next
     }
     die("unknown runtime baseline kind at line " FNR ": " $1)
+  }
+  FILENAME == emby_evidence_file {
+    if ($0 ~ /^[[:space:]]*($|#)/ || $1 == "mod") {
+      next
+    }
+    if (NF != 9) {
+      die("malformed Emby detector evidence row at line " FNR)
+    }
+    if ($1 != "emby" || !($2 in server_mod) || server_mod[$2] != "emby") {
+      die("Emby detector evidence server/mod mismatch at line " FNR ": " $1 " " $2)
+    }
+    if (!valid_arch($3)) {
+      die("invalid Emby detector evidence arch at line " FNR ": " $3)
+    }
+    if ($4 != "detect" && $4 != "pre") {
+      die("invalid Emby detector evidence kind at line " FNR ": " $4)
+    }
+    evidence_key = $1 SUBSEP $2 SUBSEP $3 SUBSEP $4 SUBSEP $5
+    if (!(evidence_key in baseline_evidence_path)) {
+      die("Emby detector evidence has no runtime baseline tuple at line " FNR ": " $2 " " $3 " " $4 " " $5)
+    }
+    if (evidence_seen[evidence_key]++) {
+      die("duplicate Emby detector evidence tuple at line " FNR ": " $2 " " $3 " " $4 " " $5)
+    }
+    if ($6 != server_image[$2]) {
+      die("Emby detector evidence image_ref mismatch at line " FNR ": " $2)
+    }
+    if ($7 != baseline_evidence_path[evidence_key] || $8 != baseline_evidence_sha[evidence_key]) {
+      die("Emby detector evidence path/SHA mismatch at line " FNR ": " $2 " " $3 " " $4 " " $5)
+    }
+    if ($9 != "pins/runtime-baselines.tsv") {
+      die("Emby detector evidence source mismatch at line " FNR ": " $9)
+    }
+    next
   }
   FILENAME == pool_sites_file {
     if ($0 ~ /^[[:space:]]*($|#)/ || $1 == "server_id") {
@@ -249,6 +299,11 @@ awk -F '\t' \
     next
   }
   END {
+    for (evidence_key in baseline_evidence_path) {
+      if (!(evidence_key in evidence_seen)) {
+        die("Emby runtime baseline tuple has no detector evidence row: " evidence_key)
+      }
+    }
     for (compat in compat_mod) {
       if (!(compat in compat_used)) {
         die("orphan compat_group has no runtime-support row: " compat)
@@ -279,6 +334,7 @@ awk -F '\t' \
   pins/library-compat-groups.tsv \
   pins/runtime-support.tsv \
   pins/runtime-baselines.tsv \
+  pins/emby-detector-evidence.tsv \
   pins/plex-pool-patch-sites.tsv \
   pins/plex-pool-patch-reviews.tsv
 
@@ -289,8 +345,8 @@ printf '%s\n' "$emby_stems" | grep -Fxq 'generic=generic' || fail "Emby generic 
 
 require_line .github/workflows/sqlite-build.yml '          compat_group_field_for_group() {'
 require_line .github/workflows/sqlite-build.yml '          first_compat_group_for_mod() {'
-require_line .github/workflows/sqlite-build.yml '          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.emby }}-${{ matrix.arch_suffix }}'
-require_line .github/workflows/sqlite-build.yml '          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.plex }}-${{ matrix.arch_suffix }}'
+require_line .github/workflows/sqlite-build.yml '          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ needs.preflight.outputs.emby_artifact_stem }}-${{ matrix.arch_suffix }}'
+require_line .github/workflows/sqlite-build.yml '          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ needs.preflight.outputs.plex_artifact_stem }}-${{ matrix.arch_suffix }}'
 reject_pattern .github/workflows/sqlite-build.yml 'name: sqlite-\$\{\{env\.SQLITE_VERSION\}\}-library-\$\{\{ matrix\.arch_suffix \}\}'
 reject_pattern .github/workflows/sqlite-build.yml 'name: sqlite-\$\{\{env\.SQLITE_VERSION\}\}-library-plex-\$\{\{ matrix\.arch_suffix \}\}'
 reject_pattern .github/workflows/sqlite-build.yml 'destination: library$'

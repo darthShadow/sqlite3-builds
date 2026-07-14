@@ -23,7 +23,10 @@ Add a new supported Plex or Emby server version in this order.
    - `mod`: `plex` or `emby`.
    - `server_id`: stable support-window id, such as `plex-1.43.2` or
      `emby-4.9.5`.
-   - `image_ref`: the curated LSIO image reference.
+   - `image_ref`: the canonical GHCR reference
+     `ghcr.io/linuxserver/<mod>:<tag>`. `lscr.io` is a vanity front for the same
+     GHCR images and is rejected by `tests/check_multi_version_pin_alignment.sh`
+     for `supported` rows and every `pre` runtime-baseline row.
    - `compat_group`: an existing group covered by
      `pins/library-compat-groups.tsv`.
    - `status`: `supported` only after the remaining rows and review evidence
@@ -41,6 +44,14 @@ Add a new supported Plex or Emby server version in this order.
    - Emby requires two detector roles per `(server_id, arch)`: `emby_deps` and
      `emby_dll`.
    - Add the `pre target_sqlite` row for each `(server_id, arch)`.
+   - For Emby, add one `pins/emby-detector-evidence.tsv` row for every
+     `(server_id, arch, kind, path_role)` baseline tuple, where `kind` is
+     `detect` or `pre`:
+     `emby<TAB>server_id<TAB>arch<TAB>kind<TAB>path_role<TAB>image_ref<TAB>file_path<TAB>sha256<TAB>pins/runtime-baselines.tsv`.
+     Copy `image_ref` from `pins/runtime-support.tsv` and `file_path` plus
+     `sha256` from `pins/runtime-baselines.tsv` exactly.
+     `tests/check_multi_version_pin_alignment.sh` rejects missing, duplicate,
+     or mismatched rows in both directions.
    - Plex also requires `pre plex_icu_linked:<soname>` rows for the three linked
      ICU sonames and matching `icu-runtime` rows for each `(compat_group, arch,
      soname)`.
@@ -67,6 +78,7 @@ Run the local verifier set before treating the version as supported:
 
 ```bash
 bash tests/check_multi_version_pin_alignment.sh
+bash tests/check_multi_version_pin_alignment_negative_test.sh
 bash tests/render_lsio_mod_baked_pins_test.sh
 bash tests/manifest_parser_test.sh
 bash tests/selector_test.sh
@@ -174,15 +186,21 @@ Release tags use CalVer with an explicit revision suffix:
 
 Current CI gates:
 
-1. `build` compiles and uploads CLI, generic library, and Plex library
-   artifacts for `linux-x86_64-v2`, `linux-x86_64-v3`, and `linux-arm64`.
-2. `release` runs only for matching tags. It publishes
-   `sqlite-<tag>-*.tar.gz` plus `SHA256SUMS`; `SHA256SUMS` includes tarball
-   SHAs and extracted `.so` SHAs for library archives.
-3. `mod-build` consumes same-run build artifacts, records support image digests,
-   renders `baked-pins.txt`, stages and smokes the Plex and Emby mod roots, and
-   uploads mod image artifacts only. It pushes nothing.
-4. `mod-publish` is tag-gated and waits for both `release` and `mod-build`. It
+1. `preflight` loads pins and compatibility-group outputs, then runs the pin and
+   Build.sh guards once.
+2. `build-cli`, `build-generic`, and `build-plex` compile and upload their
+   producer-owned artifacts for `linux-x86_64-v2`, `linux-x86_64-v3`, and
+   `linux-arm64`; the library jobs also wait for `base`.
+3. `release` waits for all three artifact jobs and `mod-static-tests`, then
+   runs only for matching tags.
+   It selects the greatest reachable prior CalVer tag, appends oldest-first
+   non-merge commit subjects to the existing compatibility body, and publishes
+   `sqlite-<tag>-*.tar.gz` plus `SHA256SUMS`; `SHA256SUMS` includes tarball SHAs
+   and extracted `.so` SHAs for library archives.
+4. `mod-build` consumes same-run generic and Plex library artifacts, records
+   support image digests, renders `baked-pins.txt`, stages and smokes the Plex
+   and Emby mod roots, and uploads mod image artifacts only. It pushes nothing.
+5. `mod-publish` is tag-gated and waits for both `release` and `mod-build`. It
    pushes per-arch GHCR tags plus final multi-arch manifests for Plex and Emby.
    It does not publish `latest`.
 

@@ -41,7 +41,15 @@ Project-specific guidance:
   keep `BASEIMAGE_ALPINE` = `ghcr.io/linuxserver/baseimage-alpine:3.23` and
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
-  `tests/check_pin_alignment.sh`; keep the literal semantics for
+  `tests/check_pin_alignment.sh`; keep the `docker-library/Dockerfile` ICU and
+  mimalloc dependency layers above all 18 project `COPY` lines; keep the
+  `.github/workflows/sqlite-build.yml` GHCR `type=registry` cache contract
+  (import the event ref and then the baseline ref; export the event ref only,
+  gated on `CACHE_EXPORT_ENABLED` and `continue-on-error: true`; forbid
+  `type=gha`) aligned with the hardcoded counts in
+  `tests/check_pin_alignment.sh` (18 project `COPY` lines, 6 `Load version pins`
+  steps, each of 3 cache scopes appearing twice, 3 baseline refs, and 6 event
+  refs); keep the literal semantics for
   `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` and
   `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` aligned across their `src/*.c` owners,
   `docs/env-vars.md`, this file, and `tests/check_pin_alignment.sh`.

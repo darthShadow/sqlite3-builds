@@ -41,8 +41,8 @@ The supported Plex pool-patch surface is keyed by `server_id` rows in
 
 | Server ID | Image ref | Compat group |
 |---|---|---|
-| `plex-1.43.1` | `lscr.io/linuxserver/plex:1.43.1` | `icu69` |
-| `plex-1.43.2` | `lscr.io/linuxserver/plex:1.43.2` | `icu69` |
+| `plex-1.43.1` | `ghcr.io/linuxserver/plex:1.43.1` | `icu69` |
+| `plex-1.43.2` | `ghcr.io/linuxserver/plex:1.43.2` | `icu69` |
 
 For each supported `server_id` and arch, pristine Plex detector SHAs live in
 `pins/runtime-baselines.tsv` and render into `detect` rows whose path roles end

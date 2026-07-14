@@ -1,5 +1,9 @@
 name: Build sqlite
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref || github.run_id }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 on:
   push:
     branches: [main]
@@ -15,6 +19,8 @@ env:
   docker_cli_image: "sqlite3-cli"
   docker_library_image: "sqlite3-library"
   docker_library_plex_image: "sqlite3-library-plex"
+  CACHE_EVENT_NAME: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'baseline' }}
+  CACHE_EXPORT_ENABLED: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'darthshadow/sqlite3-builds') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
 
 jobs:
   base:
@@ -24,40 +30,21 @@ jobs:
       packages: write
     secrets: inherit
 
-  build:
-    needs: base
-    timeout-minutes: 30
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
-      packages: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            march: x86-64-v2
-            arch_suffix: linux-x86_64-v2
-          - runner: ubuntu-24.04
-            march: x86-64-v3
-            arch_suffix: linux-x86_64-v3
-          - runner: ubuntu-24.04-arm
-            march: armv8-a
-            arch_suffix: linux-arm64
-    runs-on: ${{ matrix.runner }}
+    outputs:
+      emby_artifact_stem: ${{ steps.library_artifact_stems.outputs.emby }}
+      plex_artifact_stem: ${{ steps.library_artifact_stems.outputs.plex }}
+      plex_icu_source_version: ${{ steps.library_artifact_stems.outputs.plex_icu_source_version }}
+      plex_icu_source_sha512: ${{ steps.library_artifact_stems.outputs.plex_icu_source_sha512 }}
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Load version pins
         run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-      - name: Login to GHCR
-        if: github.event_name == 'push' && github.repository == 'darthshadow/sqlite3-builds'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
       - name: Load library artifact stems
         id: library_artifact_stems
         run: |
@@ -141,6 +128,124 @@ jobs:
           bash tests/check_multi_version_pin_alignment.sh
       - name: Build.sh precheck paths
         run: bash tests/check_build_sh_prechecks.sh
+
+  build-cli:
+    needs: preflight
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            march: x86-64-v2
+            arch_suffix: linux-x86_64-v2
+          - runner: ubuntu-24.04
+            march: x86-64-v3
+            arch_suffix: linux-x86_64-v3
+          - runner: ubuntu-24.04-arm
+            march: armv8-a
+            arch_suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Login to GHCR
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build sqlite CLI
+        run: |
+          set -euo pipefail
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          cache_scope="sqlite3-cli-${{ matrix.march }}-${{ runner.arch }}"
+          baseline_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-baseline"
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
+          docker buildx build --load \
+            --cache-from type=registry,ref="${event_cache_ref}" \
+            --cache-from type=registry,ref="${baseline_cache_ref}" \
+            -t "${docker_cli_image}" \
+            -f docker-cli/Dockerfile \
+            --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
+            --build-arg COMPRESS_SQLITE3="upx" \
+            --build-arg MARCH="${{ matrix.march }}" \
+            --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            .
+      - name: Export sqlite CLI build cache
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          cache_scope="sqlite3-cli-${{ matrix.march }}-${{ runner.arch }}"
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
+          docker buildx build \
+            --cache-to type=registry,ref="${event_cache_ref}",mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd \
+            -f docker-cli/Dockerfile \
+            --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
+            --build-arg COMPRESS_SQLITE3="upx" \
+            --build-arg MARCH="${{ matrix.march }}" \
+            --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            .
+      - name: Extract binary from docker image
+        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
+        id: extract_cli
+        with:
+          image: ${{env.docker_cli_image}}
+          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
+          destination: cli
+      - name: Plex FTS STAT4 EQP repro
+        run: bash tests/plex_fts_stat4_eqp_repro_test.sh cli/sqlite3
+      - name: Upload sqlite CLI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.extract_cli.outputs.destination }}
+          name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
+          retention-days: 90
+
+  build-generic:
+    needs: [preflight, base]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            march: x86-64-v2
+            arch_suffix: linux-x86_64-v2
+          - runner: ubuntu-24.04
+            march: x86-64-v3
+            arch_suffix: linux-x86_64-v3
+          - runner: ubuntu-24.04-arm
+            march: armv8-a
+            arch_suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Login to GHCR
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
       - name: Resolve generic library base image
         env:
           BASE_IMAGE: ${{ needs.base.outputs.image }}
@@ -165,55 +270,37 @@ jobs:
             --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" \
             -f docker-build-base/Dockerfile docker-build-base/
           printf 'BASE_IMAGE=%s\n' "${base_ref}" >> "${GITHUB_ENV}"
-      - name: Build sqlite CLI
-        env:
-          CACHE_EXPORT_ENABLED: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Build sqlite library
         run: |
           set -euo pipefail
-          cache_scope="sqlite3-cli-${{ matrix.march }}-${{ runner.arch }}"
-          cache_to_args=()
-          if [ "${CACHE_EXPORT_ENABLED}" = "true" ]; then
-            cache_to_args=(--cache-to type=gha,mode=max,scope="$cache_scope")
-          fi
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          cache_scope="sqlite3-library-generic-${{ matrix.march }}-${{ runner.arch }}"
+          baseline_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-baseline"
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
           docker buildx build --load \
-            --cache-from type=gha,scope="$cache_scope" \
-            "${cache_to_args[@]}" \
-            -t "${docker_cli_image}" \
-            -f docker-cli/Dockerfile \
+            --cache-from type=registry,ref="${event_cache_ref}" \
+            --cache-from type=registry,ref="${baseline_cache_ref}" \
+            -t "${docker_library_image}" \
+            -f docker-library/Dockerfile \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}" \
             --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
-            --build-arg COMPRESS_SQLITE3="upx" \
             --build-arg MARCH="${{ matrix.march }}" \
             --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
+            --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
+            --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
             .
-      - name: Extract binary from docker image
-        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
-        id: extract_cli
-        with:
-          image: ${{env.docker_cli_image}}
-          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
-          destination: cli
-      - name: Plex FTS STAT4 EQP repro
-        run: bash tests/plex_fts_stat4_eqp_repro_test.sh cli/sqlite3
-      - name: Upload sqlite CLI artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          path: ${{ steps.extract_cli.outputs.destination }}
-          name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
-          retention-days: 90
-      - name: Build sqlite library
-        env:
-          CACHE_EXPORT_ENABLED: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
+      - name: Export sqlite generic library build cache
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        continue-on-error: true
         run: |
           set -euo pipefail
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
           cache_scope="sqlite3-library-generic-${{ matrix.march }}-${{ runner.arch }}"
-          cache_to_args=()
-          if [ "${CACHE_EXPORT_ENABLED}" = "true" ]; then
-            cache_to_args=(--cache-to type=gha,mode=max,scope="$cache_scope")
-          fi
-          docker buildx build --load \
-            --cache-from type=gha,scope="$cache_scope" \
-            "${cache_to_args[@]}" \
-            -t "${docker_library_image}" \
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
+          docker buildx build \
+            --cache-to type=registry,ref="${event_cache_ref}",mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd \
             -f docker-library/Dockerfile \
             --build-arg BASE_IMAGE="${BASE_IMAGE}" \
             --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}" \
@@ -230,101 +317,13 @@ jobs:
         with:
           image: ${{env.docker_library_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
-          destination: library-${{ steps.library_artifact_stems.outputs.emby }}
+          destination: library-${{ needs.preflight.outputs.emby_artifact_stem }}
       - name: Upload sqlite library artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_library.outputs.destination }}
-          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.emby }}-${{ matrix.arch_suffix }}
+          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ needs.preflight.outputs.emby_artifact_stem }}-${{ matrix.arch_suffix }}
           retention-days: 90
-      - name: Build sqlite Plex library
-        env:
-          CACHE_EXPORT_ENABLED: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
-        run: |
-          set -euo pipefail
-          cache_scope="sqlite3-library-plex-${{ matrix.march }}-${{ runner.arch }}"
-          cache_to_args=()
-          if [ "${CACHE_EXPORT_ENABLED}" = "true" ]; then
-            cache_to_args=(--cache-to type=gha,mode=max,scope="$cache_scope")
-          fi
-          docker buildx build --load \
-            --cache-from type=gha,scope="$cache_scope" \
-            "${cache_to_args[@]}" \
-            -t "${docker_library_plex_image}" \
-            -f docker-library/Dockerfile \
-            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
-            --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}" \
-            --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
-            --build-arg MARCH="${{ matrix.march }}" \
-            --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
-            --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" \
-            --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" \
-            --build-arg LIBRARY_VARIANT=plex \
-            --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
-            --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
-            --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
-            --build-arg ICU_SOURCE_VERSION="${{ steps.library_artifact_stems.outputs.plex_icu_source_version }}" \
-            --build-arg ICU_SOURCE_SHA512="${{ steps.library_artifact_stems.outputs.plex_icu_source_sha512 }}" \
-            .
-      - name: Extract Plex library from docker image
-        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
-        id: extract_library_plex
-        with:
-          image: ${{env.docker_library_plex_image}}
-          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
-          destination: library-${{ steps.library_artifact_stems.outputs.plex }}
-      - name: Upload sqlite Plex library artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          path: ${{ steps.extract_library_plex.outputs.destination }}
-          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.plex }}-${{ matrix.arch_suffix }}
-          retention-days: 90
-      - name: Plex support-window smokes
-        run: |
-          set -euo pipefail
-          . ./tools/ci/retry.sh
-          compat_group_field_for_group() {
-            local compat_group="$1" field="$2"
-            awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
-              NR == 1 {
-                for (i = 1; i <= NF; i++) {
-                  if ($i == want_field) field_index = i
-                }
-                if (field_index == 0) {
-                  printf "FATAL: missing library compatibility field: %s\n", want_field > "/dev/stderr"
-                  exit 2
-                }
-                next
-              }
-              $0 ~ /^[[:space:]]*($|#)/ { next }
-              $1 == want_group {
-                value = $field_index
-              }
-              END {
-                if (value == "") {
-                  printf "FATAL: missing library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
-                  exit 1
-                }
-                print value
-              }
-            ' pins/library-compat-groups.tsv
-          }
-          awk -F '\t' '
-            $0 ~ /^[[:space:]]*($|#)/ { next }
-            $1 == "mod" { next }
-            $1 == "plex" && $5 == "supported" { print $2 "\t" $3 "\t" $4 }
-          ' pins/runtime-support.tsv |
-          while IFS=$'\t' read -r server_id image_ref compat_group; do
-            [ -n "$server_id" ] || continue
-            artifact_stem="$(compat_group_field_for_group "$compat_group" artifact_stem)"
-            icu_source_version="$(compat_group_field_for_group "$compat_group" icu_source_version)"
-            library_dir="library-${artifact_stem}"
-            [ -d "$library_dir" ] || { echo "FATAL: missing library artifact dir for compat_group=$compat_group: $library_dir" >&2; exit 1; }
-            retry docker pull "$image_ref"
-            bash tools/ci/plex-icu-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "$icu_source_version" "$library_dir"
-            bash tools/ci/plex-pms-first-init-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir" "$icu_source_version"
-            bash tools/ci/plex-pms-killswitch-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir"
-          done
       - name: Emby support-window smokes
         run: |
           set -euo pipefail
@@ -376,6 +375,175 @@ jobs:
       - name: ABI obsolete config ops test
         run: bash tests/abi_obsolete_config_ops_test.sh "${docker_library_image}"
 
+  build-plex:
+    needs: [preflight, base]
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            march: x86-64-v2
+            arch_suffix: linux-x86_64-v2
+          - runner: ubuntu-24.04
+            march: x86-64-v3
+            arch_suffix: linux-x86_64-v3
+          - runner: ubuntu-24.04-arm
+            march: armv8-a
+            arch_suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Login to GHCR
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Resolve generic library base image
+        env:
+          BASE_IMAGE: ${{ needs.base.outputs.image }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASE_IMAGE}" ]; then
+            printf 'BASE_IMAGE=%s\n' "${BASE_IMAGE}" >> "${GITHUB_ENV}"
+            exit 0
+          fi
+          base_ref_output="$(bash build/base_image_ref.sh)"
+          printf '%s\n' "${base_ref_output}"
+          base_ref="$(printf '%s\n' "${base_ref_output}" | awk -F= '$1=="BASE_REF"{print $2; exit}')"
+          if [ -z "${base_ref}" ]; then
+            echo "FATAL: build/base_image_ref.sh did not emit BASE_REF" >&2
+            exit 1
+          fi
+          docker buildx build --load --provenance=false -t "${base_ref}" \
+            --build-arg BASEIMAGE_UBUNTU="${BASEIMAGE_UBUNTU}" \
+            --build-arg CMAKE_VERSION="${CMAKE_VERSION}" \
+            --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}" \
+            --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}" \
+            --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" \
+            -f docker-build-base/Dockerfile docker-build-base/
+          printf 'BASE_IMAGE=%s\n' "${base_ref}" >> "${GITHUB_ENV}"
+      - name: Build sqlite Plex library
+        run: |
+          set -euo pipefail
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          cache_scope="sqlite3-library-plex-${{ matrix.march }}-${{ runner.arch }}"
+          baseline_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-baseline"
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
+          docker buildx build --load \
+            --cache-from type=registry,ref="${event_cache_ref}" \
+            --cache-from type=registry,ref="${baseline_cache_ref}" \
+            -t "${docker_library_plex_image}" \
+            -f docker-library/Dockerfile \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}" \
+            --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
+            --build-arg MARCH="${{ matrix.march }}" \
+            --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" \
+            --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" \
+            --build-arg LIBRARY_VARIANT=plex \
+            --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
+            --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
+            --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
+            --build-arg ICU_SOURCE_VERSION="${{ needs.preflight.outputs.plex_icu_source_version }}" \
+            --build-arg ICU_SOURCE_SHA512="${{ needs.preflight.outputs.plex_icu_source_sha512 }}" \
+            .
+      - name: Export sqlite Plex library build cache
+        if: env.CACHE_EXPORT_ENABLED == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          cache_scope="sqlite3-library-plex-${{ matrix.march }}-${{ runner.arch }}"
+          event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"
+          docker buildx build \
+            --cache-to type=registry,ref="${event_cache_ref}",mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd \
+            -f docker-library/Dockerfile \
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}" \
+            --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
+            --build-arg MARCH="${{ matrix.march }}" \
+            --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" \
+            --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" \
+            --build-arg LIBRARY_VARIANT=plex \
+            --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
+            --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
+            --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
+            --build-arg ICU_SOURCE_VERSION="${{ needs.preflight.outputs.plex_icu_source_version }}" \
+            --build-arg ICU_SOURCE_SHA512="${{ needs.preflight.outputs.plex_icu_source_sha512 }}" \
+            .
+      - name: Extract Plex library from docker image
+        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
+        id: extract_library_plex
+        with:
+          image: ${{env.docker_library_plex_image}}
+          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
+          destination: library-${{ needs.preflight.outputs.plex_artifact_stem }}
+      - name: Upload sqlite Plex library artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: ${{ steps.extract_library_plex.outputs.destination }}
+          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ needs.preflight.outputs.plex_artifact_stem }}-${{ matrix.arch_suffix }}
+          retention-days: 90
+      - name: Plex support-window smokes
+        run: |
+          set -euo pipefail
+          . ./tools/ci/retry.sh
+          compat_group_field_for_group() {
+            local compat_group="$1" field="$2"
+            awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
+              NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == want_field) field_index = i
+                }
+                if (field_index == 0) {
+                  printf "FATAL: missing library compatibility field: %s\n", want_field > "/dev/stderr"
+                  exit 2
+                }
+                next
+              }
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == want_group {
+                value = $field_index
+              }
+              END {
+                if (value == "") {
+                  printf "FATAL: missing library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
+                  exit 1
+                }
+                print value
+              }
+            ' pins/library-compat-groups.tsv
+          }
+          awk -F '\t' '
+            $0 ~ /^[[:space:]]*($|#)/ { next }
+            $1 == "mod" { next }
+            $1 == "plex" && $5 == "supported" { print $2 "\t" $3 "\t" $4 }
+          ' pins/runtime-support.tsv |
+          while IFS=$'\t' read -r server_id image_ref compat_group; do
+            [ -n "$server_id" ] || continue
+            artifact_stem="$(compat_group_field_for_group "$compat_group" artifact_stem)"
+            icu_source_version="$(compat_group_field_for_group "$compat_group" icu_source_version)"
+            library_dir="library-${artifact_stem}"
+            [ -d "$library_dir" ] || { echo "FATAL: missing library artifact dir for compat_group=$compat_group: $library_dir" >&2; exit 1; }
+            retry docker pull "$image_ref"
+            bash tools/ci/plex-icu-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "$icu_source_version" "$library_dir"
+            bash tools/ci/plex-pms-first-init-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir" "$icu_source_version"
+            bash tools/ci/plex-pms-killswitch-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir"
+          done
+
   mod-static-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -398,6 +566,7 @@ jobs:
           bash tests/mod_bake_assertions_test.sh
           bash tests/skopeo_mod_image_oci_static_test.sh
           bash tests/sqlite_build_workflow_mod_only_test.sh
+          bash tests/render_release_notes_test.sh
           bash tests/docs_mod_only_direction_c_test.sh
       - name: Install test deps
         run: |
@@ -408,6 +577,7 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/check_pin_alignment_negative_test.sh
+          bash tests/check_multi_version_pin_alignment_negative_test.sh
           bash tests/lsio_mod_phase03_install_failure_test.sh
           bash tests/lsio_mod_plex_poolpatch_phase_test.sh
           bash tests/lsio_mod_preflight_artifact_root_test.sh
@@ -433,7 +603,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build-cli, build-generic, build-plex, mod-static-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -441,6 +611,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
       - name: Load version pins
         run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
       - name: Load release compatibility summary
@@ -499,6 +671,18 @@ jobs:
             echo "FATAL: release tag does not match YYYY.MM.DD-rN: ${release_tag}" >&2
             exit 1
           fi
+      - name: Render release commit summaries
+        id: commit_summaries
+        env:
+          RELEASE_NOTES_DELIMITER: EOF_RELEASE_NOTES_CHANGES
+        run: |
+          set -euo pipefail
+          changes="$(bash tools/ci/render-release-notes.sh "${GITHUB_REF_NAME}" "${RELEASE_NOTES_DELIMITER}")"
+          {
+            printf 'changes<<%s\n' "${RELEASE_NOTES_DELIMITER}"
+            printf '%s\n' "${changes}"
+            printf '%s\n' "${RELEASE_NOTES_DELIMITER}"
+          } >> "${GITHUB_OUTPUT}"
       - name: Archive release artifacts
         run: |
           set -euo pipefail
@@ -548,7 +732,9 @@ jobs:
               linuxserver-mod-sqlite3-plex
               linuxserver-mod-sqlite3-emby
 
-            Changes: https://www.sqlite.org/changes.html
+            SQLite upstream changes: https://www.sqlite.org/changes.html
+
+            ${{ steps.commit_summaries.outputs.changes }}
           files: |
             sqlite-${{ github.ref_name }}-*.tar.gz
             SHA256SUMS
@@ -556,7 +742,7 @@ jobs:
           prerelease: false
 
   mod-build:
-    needs: build
+    needs: [build-generic, build-plex]
     timeout-minutes: 30
     permissions:
       contents: read
@@ -594,7 +780,7 @@ jobs:
       - name: Download sqlite artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: sqlite-*
+          pattern: sqlite-*-library-*
           path: sqlite-artifacts
           merge-multiple: false
           digest-mismatch: warn

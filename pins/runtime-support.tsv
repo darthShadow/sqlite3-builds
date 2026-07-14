@@ -1,5 +1,5 @@
 mod	server_id	image_ref	compat_group	status	review_ref	notes
-plex	plex-1.43.2	lscr.io/linuxserver/plex:1.43.2	icu69	supported	SIGNED-OFF 1.43.2 pool-site derivation	SIGNED-OFF 1.43.2 pool-site derivation; A and B agree byte-for-byte
-plex	plex-1.43.1	lscr.io/linuxserver/plex:1.43.1	icu69	supported	SIGNED-OFF 1.43.1 pool-site derivation	SIGNED-OFF 1.43.1 pool-site derivation; A and B agree byte-for-byte
-emby	emby-4.9.3	lscr.io/linuxserver/emby:version-4.9.3.0	generic	supported	pins/emby-detector-evidence.tsv	primary stable alias; /app/emby/system detectors and /app/emby/lib/libsqlite3.so.3.49.2 confirmed in pins/emby-detector-evidence.tsv
-emby	emby-4.9.5	lscr.io/linuxserver/emby:version-4.9.5.0	generic	supported	pins/emby-detector-evidence.tsv	stable-only secondary alias; /app/emby/system detectors and /app/emby/lib/libsqlite3.so.3.49.2 confirmed in pins/emby-detector-evidence.tsv
+plex	plex-1.43.2	ghcr.io/linuxserver/plex:1.43.2	icu69	supported	SIGNED-OFF 1.43.2 pool-site derivation	SIGNED-OFF 1.43.2 pool-site derivation; A and B agree byte-for-byte
+plex	plex-1.43.1	ghcr.io/linuxserver/plex:1.43.1	icu69	supported	SIGNED-OFF 1.43.1 pool-site derivation	SIGNED-OFF 1.43.1 pool-site derivation; A and B agree byte-for-byte
+emby	emby-4.9.3	ghcr.io/linuxserver/emby:version-4.9.3.0	generic	supported	pins/emby-detector-evidence.tsv	primary stable alias; /app/emby/system detectors and /app/emby/lib/libsqlite3.so.3.49.2 confirmed in pins/emby-detector-evidence.tsv
+emby	emby-4.9.5	ghcr.io/linuxserver/emby:version-4.9.5.0	generic	supported	pins/emby-detector-evidence.tsv	stable-only secondary alias; /app/emby/system detectors and /app/emby/lib/libsqlite3.so.3.49.2 confirmed in pins/emby-detector-evidence.tsv

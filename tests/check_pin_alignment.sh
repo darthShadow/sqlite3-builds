@@ -53,6 +53,25 @@ require_pattern() {
   grep -Eq -- "$pattern" "$file" || fail "$label missing from $file"
 }
 
+require_project_copies_after() {
+  file="$1"
+  marker="$2"
+  expected_count="$3"
+  label="$4"
+  awk -v marker="$marker" -v expected_count="$expected_count" '
+    $0 == marker { marker_seen = 1 }
+    /^COPY ([^ ]+ )*(build\/|src\/|tests\/)/ {
+      copy_count++
+      if (!marker_seen) {
+        copy_before_marker = 1
+      }
+    }
+    END {
+      exit(marker_seen && copy_count == expected_count && !copy_before_marker ? 0 : 1)
+    }
+  ' "$file" || fail "$label invalid in $file: expected $expected_count project COPY lines after '$marker'"
+}
+
 legacy_scalar_keys() {
   printf '%s_%s_%s\n' PLEX IMAGE TAG
   printf '%s_%s_%s\n' EMBY IMAGE TAG
@@ -222,6 +241,61 @@ require_workflow_step_no_pattern() {
   fi
 }
 
+require_workflow_step_line() {
+  workflow_step_file="$1"
+  workflow_step_name="$2"
+  workflow_step_expected="$3"
+  workflow_step_label="$4"
+  workflow_step_body="$(awk -v step="$workflow_step_name" '
+    /^[[:space:]]+- name: / {
+      if (in_step) {
+        in_step = 0
+      }
+      if (index($0, "- name: " step) > 0) {
+        in_step = 1
+        found = 1
+        next
+      }
+    }
+    in_step { print }
+    END { if (!found) exit 2 }
+  ' "$workflow_step_file")" || fail "$workflow_step_file missing workflow step: $workflow_step_name"
+  workflow_step_line_count="$(printf '%s\n' "$workflow_step_body" | grep -Fxc -- "$workflow_step_expected" || true)"
+  assert_eq "$workflow_step_label exact-line count" '1' "$workflow_step_line_count"
+}
+
+require_cache_family_topology() {
+  cache_file="$1"
+  cache_build_step="$2"
+  cache_export_step="$3"
+  cache_label="$4"
+  require_workflow_step_line \
+    "$cache_file" \
+    "$cache_build_step" \
+    '            --cache-from type=registry,ref="${event_cache_ref}" \' \
+    "$cache_label event cache import"
+  require_workflow_step_line \
+    "$cache_file" \
+    "$cache_build_step" \
+    '            --cache-from type=registry,ref="${baseline_cache_ref}" \' \
+    "$cache_label baseline cache import"
+  require_workflow_step_line \
+    "$cache_file" \
+    "$cache_export_step" \
+    '            --cache-to type=registry,ref="${event_cache_ref}",mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd \' \
+    "$cache_label event-only cache export"
+  require_workflow_step_line \
+    "$cache_file" \
+    "$cache_export_step" \
+    "        if: env.CACHE_EXPORT_ENABLED == 'true'" \
+    "$cache_label cache event gate"
+  require_workflow_step_line \
+    "$cache_file" \
+    "$cache_export_step" \
+    '        continue-on-error: true' \
+    "$cache_label cache best-effort policy"
+}
+
 compat_group_pin() {
   compat_group="$1"
   field="$2"
@@ -283,7 +357,7 @@ require_line build/build_static_sqlite.sh 'compat_groups_file="${script_dir}/../
 require_line .github/workflows/sqlite-build.yml '        run: grep -E '\''^[A-Za-z_][A-Za-z0-9_]*='\'' pins/versions.env >> "$GITHUB_ENV"'
 
 load_step_count="$(grep -Fc "run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> \"\$GITHUB_ENV\"" .github/workflows/sqlite-build.yml)"
-assert_eq '.github/workflows/sqlite-build.yml Load version pins step count' '3' "$load_step_count"
+assert_eq '.github/workflows/sqlite-build.yml Load version pins step count' '6' "$load_step_count"
 
 top_env_pins="$(awk '
   /^env:/ { in_env=1; next }
@@ -403,8 +477,54 @@ require_line .github/workflows/base.yml '            --build-arg UBUNTU_TOOLCHAI
 
 require_pattern .github/workflows/sqlite-build.yml 'docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5' 'main workflow setup-buildx action'
 require_pattern .github/workflows/sqlite-build.yml 'docker buildx build --load' 'main workflow buildx local load'
-require_pattern .github/workflows/sqlite-build.yml '--cache-from type=gha' 'main workflow GHA cache import'
-require_pattern .github/workflows/sqlite-build.yml '--cache-to type=gha,mode=max' 'main workflow GHA cache export'
+require_line .github/workflows/sqlite-build.yml "  group: \${{ github.workflow }}-\${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref || github.run_id }}"
+require_line .github/workflows/sqlite-build.yml "  cancel-in-progress: \${{ !startsWith(github.ref, 'refs/tags/') }}"
+reject_line .github/workflows/sqlite-build.yml '  CACHE_EVENT_NAME: baseline'
+reject_pattern .github/workflows/sqlite-build.yml '--cache-to type=registry,ref="\$\{baseline_cache_ref\}"'
+reject_pattern .github/workflows/sqlite-build.yml 'type=gha'
+require_line .github/workflows/sqlite-build.yml "  CACHE_EVENT_NAME: \${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'baseline' }}"
+require_line .github/workflows/sqlite-build.yml "  CACHE_EXPORT_ENABLED: \${{ (github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'darthshadow/sqlite3-builds') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}"
+require_line .github/workflows/sqlite-build.yml "        if: env.CACHE_EXPORT_ENABLED == 'true'"
+require_line .github/workflows/sqlite-build.yml '          cache_scope="sqlite3-cli-${{ matrix.march }}-${{ runner.arch }}"'
+require_line .github/workflows/sqlite-build.yml '          cache_scope="sqlite3-library-generic-${{ matrix.march }}-${{ runner.arch }}"'
+require_line .github/workflows/sqlite-build.yml '          cache_scope="sqlite3-library-plex-${{ matrix.march }}-${{ runner.arch }}"'
+cli_scope_count="$(grep -Fc 'cache_scope="sqlite3-cli-${{ matrix.march }}-${{ runner.arch }}"' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml CLI cache scope count' '2' "$cli_scope_count"
+generic_scope_count="$(grep -Fc 'cache_scope="sqlite3-library-generic-${{ matrix.march }}-${{ runner.arch }}"' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml generic cache scope count' '2' "$generic_scope_count"
+plex_scope_count="$(grep -Fc 'cache_scope="sqlite3-library-plex-${{ matrix.march }}-${{ runner.arch }}"' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml Plex cache scope count' '2' "$plex_scope_count"
+baseline_ref_count="$(grep -Fc 'baseline_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-baseline"' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml baseline cache ref count' '3' "$baseline_ref_count"
+event_ref_count="$(grep -Fc 'event_cache_ref="ghcr.io/${owner_lc}/sqlite3-build-cache:${cache_scope}-${CACHE_EVENT_NAME}"' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml event cache ref count' '6' "$event_ref_count"
+event_import_count="$(grep -Fc '            --cache-from type=registry,ref="${event_cache_ref}" \' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml event cache import count' '3' "$event_import_count"
+baseline_import_count="$(grep -Fc '            --cache-from type=registry,ref="${baseline_cache_ref}" \' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml baseline cache import count' '3' "$baseline_import_count"
+cache_import_total_count="$(grep -Fc -- '--cache-from ' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml total cache import count' '6' "$cache_import_total_count"
+event_export_count="$(grep -Fc '            --cache-to type=registry,ref="${event_cache_ref}",mode=max,oci-mediatypes=true,image-manifest=true,compression=zstd \' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml event cache export count' '3' "$event_export_count"
+cache_export_total_count="$(grep -Fc -- '--cache-to ' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml total cache export count' '3' "$cache_export_total_count"
+best_effort_export_count="$(grep -Fc '        continue-on-error: true' .github/workflows/sqlite-build.yml || true)"
+assert_eq '.github/workflows/sqlite-build.yml best-effort cache export count' '3' "$best_effort_export_count"
+require_cache_family_topology \
+  .github/workflows/sqlite-build.yml \
+  'Build sqlite CLI' \
+  'Export sqlite CLI build cache' \
+  'CLI'
+require_cache_family_topology \
+  .github/workflows/sqlite-build.yml \
+  'Build sqlite library' \
+  'Export sqlite generic library build cache' \
+  'generic'
+require_cache_family_topology \
+  .github/workflows/sqlite-build.yml \
+  'Build sqlite Plex library' \
+  'Export sqlite Plex library build cache' \
+  'Plex'
 require_pattern .github/workflows/sqlite-build.yml '--build-arg BASE_IMAGE="\$\{BASE_IMAGE\}"' 'library BASE_IMAGE build arg'
 require_pattern .github/workflows/sqlite-build.yml '--build-arg BASEIMAGE_ALPINE="\$\{BASEIMAGE_ALPINE\}"' 'library BASEIMAGE_ALPINE build arg'
 reject_pattern .github/workflows/sqlite-build.yml 'sudo docker build|--platform'
@@ -530,6 +650,11 @@ require_line docker-library/Dockerfile 'FROM ${BASEIMAGE_ALPINE} AS base-plex'
 require_line docker-library/Dockerfile "      generic_glibc_max=\"${GENERIC_GLIBC_MAX}\"; \\"
 require_line docker-library/Dockerfile 'ENTRYPOINT []'
 require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
+require_project_copies_after \
+  docker-library/Dockerfile \
+  'ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a' \
+  18 \
+  'library dependency layers before all project COPY lines'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_URL'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
 require_line docker-library/Dockerfile 'ARG SQLITE_SRC_URL=""'

@@ -42,27 +42,6 @@ ARG LIBRARY_VARIANT=generic
 
 WORKDIR /app
 
-COPY build/Build.sh /app/Build.sh
-COPY src/auto_extension.c /app/auto_extension.c
-COPY src/runtime_optimize.c /app/runtime_optimize.c
-COPY src/auto_extension_internal.h /app/auto_extension_internal.h
-COPY src/observability.c /app/observability.c
-COPY src/observability.h /app/observability.h
-COPY src/slow_query_tracker.c /app/slow_query_tracker.c
-COPY src/fts_lex.c /app/fts_lex.c
-COPY src/fts_lex.h /app/fts_lex.h
-COPY src/plex_fts_rewrite.c /app/plex_fts_rewrite.c
-COPY src/plex_fts_rewrite.h /app/plex_fts_rewrite.h
-COPY src/emby_fts_rewrite.c /app/emby_fts_rewrite.c
-COPY src/emby_fts_rewrite.h /app/emby_fts_rewrite.h
-COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
-COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
-COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
-COPY build/libsqlite3-version-script.ld /app/build/libsqlite3-version-script.ld
-COPY tests/ /app/tests/
-
-RUN chmod +x /app/Build.sh
-
 ARG ICU_SOURCE_VERSION
 ARG ICU_SOURCE_SHA512
 RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
@@ -124,6 +103,27 @@ ENV MIMALLOC_URL="${MIMALLOC_URL}"
 ENV MIMALLOC_SHA512="${MIMALLOC_SHA512}"
 ENV MIMALLOC_OBJ=/opt/mimalloc/lib/mimalloc.o
 ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a
+
+COPY build/Build.sh /app/Build.sh
+COPY src/auto_extension.c /app/auto_extension.c
+COPY src/runtime_optimize.c /app/runtime_optimize.c
+COPY src/auto_extension_internal.h /app/auto_extension_internal.h
+COPY src/observability.c /app/observability.c
+COPY src/observability.h /app/observability.h
+COPY src/slow_query_tracker.c /app/slow_query_tracker.c
+COPY src/fts_lex.c /app/fts_lex.c
+COPY src/fts_lex.h /app/fts_lex.h
+COPY src/plex_fts_rewrite.c /app/plex_fts_rewrite.c
+COPY src/plex_fts_rewrite.h /app/plex_fts_rewrite.h
+COPY src/emby_fts_rewrite.c /app/emby_fts_rewrite.c
+COPY src/emby_fts_rewrite.h /app/emby_fts_rewrite.h
+COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
+COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
+COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
+COPY build/libsqlite3-version-script.ld /app/build/libsqlite3-version-script.ld
+COPY tests/ /app/tests/
+
+RUN chmod +x /app/Build.sh
 
 ARG MARCH
 ARG SQLITE_AMALG_URL

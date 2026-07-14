@@ -66,16 +66,24 @@ from pathlib import Path
 
 text = Path(".github/workflows/sqlite-build.yml").read_text()
 mod_bake_script = Path("tools/ci/mod-bake-smoke.sh").read_text()
+preflight = text.split("\n  preflight:", 1)[1].split("\n  build-cli:", 1)[0]
+build_cli = text.split("\n  build-cli:", 1)[1].split("\n  build-generic:", 1)[0]
+build_generic = text.split("\n  build-generic:", 1)[1].split("\n  build-plex:", 1)[0]
+build_plex = text.split("\n  build-plex:", 1)[1].split("\n  mod-static-tests:", 1)[0]
 release = text.split("\n  release:", 1)[1].split("\n  mod-build:", 1)[0]
 mod_build = text.split("\n  mod-build:", 1)[1].split("\n  mod-publish:", 1)[0]
 mod_publish = text.split("\n  mod-publish:", 1)[1]
 
-if "needs: build" not in mod_build:
-    raise SystemExit("mod-build job missing needs: build")
+if "needs: [build-cli, build-generic, build-plex, mod-static-tests]" not in release:
+    raise SystemExit("release job does not gate on artifacts and mod-static-tests")
+if "needs: [build-generic, build-plex]" not in mod_build:
+    raise SystemExit("mod-build job missing generic/Plex artifact needs")
 if "needs: release" in mod_build:
     raise SystemExit("mod-build job still depends on release")
 if "startsWith(github.ref, 'refs/tags/')" in mod_build:
     raise SystemExit("mod-build job is still tag-gated")
+if "pattern: sqlite-*-library-*" not in mod_build:
+    raise SystemExit("mod-build artifact download is not library-only")
 if "actions/upload-artifact@" not in mod_build:
     raise SystemExit("mod-build job missing upload-artifact step")
 if "${{ matrix.platform }}" in mod_build:
@@ -103,17 +111,57 @@ if '${arch}:${compat_group}:${artifact_name}:${artifact_path}:${target_path}' no
 if '${arch}:${compat_group}:${artifact_path}' not in mod_bake_script:
     raise SystemExit("mod-bake script missing group-aware stage artifact tuple")
 
-build = text.split("\n  build:", 1)[1].split("\n  mod-static-tests:", 1)[0]
-for script in [
-    "tools/ci/plex-icu-smoke.sh",
-    "tools/ci/plex-pms-first-init-smoke.sh",
-    "tools/ci/plex-pms-killswitch-smoke.sh",
-    "tools/ci/emby-first-init-smoke.sh",
-    "tools/ci/slow-query-smoke.sh",
-    "tools/ci/emby-killswitch-smoke.sh",
+for command in [
+    "bash tests/check_pin_alignment.sh",
+    "bash tests/check_multi_version_pin_alignment.sh",
+    "bash tests/check_build_sh_prechecks.sh",
 ]:
-    if f"bash {script}" not in build:
-        raise SystemExit(f"build job missing extracted script invocation: {script}")
+    if text.count(command) != 1 or command not in preflight:
+        raise SystemExit(f"preflight must own one guard invocation: {command}")
+
+if "needs: preflight" not in build_cli:
+    raise SystemExit("build-cli job missing preflight need")
+if "needs: [preflight, base]" in build_cli:
+    raise SystemExit("build-cli job unnecessarily waits for base")
+for name, section in [("build-generic", build_generic), ("build-plex", build_plex)]:
+    if "needs: [preflight, base]" not in section:
+        raise SystemExit(f"{name} job missing preflight/base needs")
+for name, section in [("build-cli", build_cli), ("build-generic", build_generic), ("build-plex", build_plex)]:
+    if "steps.library_artifact_stems.outputs" in section:
+        raise SystemExit(f"{name} still references producer-local preflight step outputs")
+
+producer_scripts = {
+    "build-cli": (build_cli, ["tests/plex_fts_stat4_eqp_repro_test.sh"]),
+    "build-generic": (
+        build_generic,
+        [
+            "tools/ci/emby-first-init-smoke.sh",
+            "tools/ci/emby-killswitch-smoke.sh",
+            "tools/ci/slow-query-smoke.sh",
+            "tests/check_obs_counts.sh",
+            "tests/abi_obsolete_config_ops_test.sh",
+        ],
+    ),
+    "build-plex": (
+        build_plex,
+        [
+            "tools/ci/plex-icu-smoke.sh",
+            "tools/ci/plex-pms-first-init-smoke.sh",
+            "tools/ci/plex-pms-killswitch-smoke.sh",
+        ],
+    ),
+}
+for job, (section, scripts) in producer_scripts.items():
+    for script in scripts:
+        if f"bash {script}" not in section:
+            raise SystemExit(f"{job} missing producer-owned script: {script}")
+
+for script in producer_scripts["build-generic"][1]:
+    if script in build_plex:
+        raise SystemExit(f"build-plex contains generic-owned script: {script}")
+for script in producer_scripts["build-plex"][1]:
+    if script in build_generic:
+        raise SystemExit(f"build-generic contains Plex-owned script: {script}")
 
 static_tests = text.split("\n  mod-static-tests:", 1)[1].split("\n  release:", 1)[0]
 if "bash tests/ci_log_assertions_test.sh" not in static_tests:
@@ -142,6 +190,16 @@ if '${{ steps.release_compat.outputs.runtime_support_window }}' not in release:
     raise SystemExit("release body missing enumerated runtime support window")
 if '$5 == "supported"' not in release:
     raise SystemExit("release support window must enumerate supported runtime rows only")
+if "fetch-depth: 0" not in release:
+    raise SystemExit("release checkout missing full history")
+if 'bash tools/ci/render-release-notes.sh "${GITHUB_REF_NAME}" "${RELEASE_NOTES_DELIMITER}"' not in release:
+    raise SystemExit("release job missing tested renderer invocation")
+if "changes<<%s\\n" not in release or "EOF_RELEASE_NOTES_CHANGES" not in release:
+    raise SystemExit("release job missing guarded changes heredoc")
+if "${{ steps.commit_summaries.outputs.changes }}" not in release:
+    raise SystemExit("release body missing rendered commit summaries")
+if "body_path:" in release:
+    raise SystemExit("release job replaced the inline compatibility body")
 if "icu-${{ github.ref_name }}-" in release:
     raise SystemExit("release job still publishes ICU tarball")
 for forbidden in ["SQLITE_LIBRARY_PINS", "release-assets/update-sqlite-library.sh"]:

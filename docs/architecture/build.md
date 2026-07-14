@@ -142,7 +142,7 @@ links a shared object, applies library-only feature defaults, and writes
 For `library`, the link line prepends `MIMALLOC_OBJ`
 (`/opt/mimalloc/lib/mimalloc.o`) and `MIMALLOC_LIB`
 (`/opt/mimalloc/lib/libmimalloc.a`) so both shared-library variants interpose
-mimalloc at link time while the CLI target stays unchanged.
+mimalloc at link time. The CLI target uses the platform allocator.
 
 The same library-only link adds
 `-Wl,--version-script=/app/build/libsqlite3-version-script.ld`. The script
@@ -230,10 +230,12 @@ the current run. The per-run generic branch performs no `apt` work, no PPA
 registration, and no CMake installation. Those steps belong to the generic
 build-base image.
 
-The same Dockerfile builds mimalloc v3.3.2 in a dedicated stage, installs it
+The same Dockerfile builds mimalloc v3.3.2 in a dedicated layer, installs it
 under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 `MIMALLOC_OBJ` plus `MIMALLOC_LIB` into `Build.sh`. The Plex branch adds
-`-DMI_LIBC_MUSL=ON`; the generic branch does not.
+`-DMI_LIBC_MUSL=ON`; the generic branch does not. The ICU and mimalloc
+dependency layers precede every project `COPY`, so source and test edits do not
+invalidate those dependency layers.
 
 For the generic variant, it builds the shared library, requires at least one
 `@GLIBC_`-versioned undefined symbol, rejects any observed `@GLIBC_` reference
@@ -293,21 +295,27 @@ linux/arm64 manifest platforms.
 Fork pull requests and other events without package write authority do not push
 to GHCR. When the content-hash base is missing, the caller builds
 `docker-build-base/` locally with `docker buildx build --load`, uses the computed
-local reference as `BASE_IMAGE`, and continues in the same matrix job.
+local reference as `BASE_IMAGE`, and continues in the same artifact job;
+`build-generic` and `build-plex` each carry the fallback step.
 
 ### Workflow Matrix
 
 `.github/workflows/sqlite-build.yml` builds on pushes to `main`,
 digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
-manual dispatch. The workflow jobs are `base`, `build`, `mod-static-tests`,
-`release`, `mod-build`, and `mod-publish`. The `base` job calls the reusable
-base workflow and supplies the resolved generic `BASE_IMAGE` digest to the
-build matrix when GHCR already has it or a trusted run can publish it. The
-release job validates `YYYY.MM.DD-rN` before archive assembly and release asset
-publication; `mod-build` and
-`mod-publish` handle LSIO mod images.
+manual dispatch. The workflow jobs are `base`, `preflight`, `build-cli`,
+`build-generic`, `build-plex`, `mod-static-tests`, `release`, `mod-build`, and
+`mod-publish`. The `base` job resolves the generic `BASE_IMAGE`. `preflight`
+loads the pins and compatibility-group artifact stems, then runs pin alignment
+and Build.sh prechecks once. The three artifact jobs wait for `preflight`;
+`build-generic` and `build-plex` also wait for `base`. A tag-gated `release`
+waits for all three artifact jobs and the `mod-static-tests` suite.
 
-The build job uses an architecture matrix:
+A workflow-level `concurrency` group keys pull requests by PR number and other
+runs by `github.ref`, and cancels superseded in-progress runs. Cancellation is
+disabled for `refs/tags/`, so release runs are not cancelled. The three artifact
+jobs hold `packages: write` for the GHCR build-cache package.
+
+Each artifact job uses the same native architecture matrix:
 
 | Runner | `MARCH` | Suffix |
 |---|---|---|
@@ -315,53 +323,68 @@ The build job uses an architecture matrix:
 | `ubuntu-24.04` | `x86-64-v3` | `linux-x86_64-v3` |
 | `ubuntu-24.04-arm` | `armv8-a` | `linux-arm64` |
 
-Each matrix row builds three Docker images: CLI, generic library, and Plex
-library. Per-run builds use Buildx with `--load`, import `type=gha` layer cache
-by image family, `MARCH`, and runner architecture, and export
-`type=gha,mode=max` cache only on trusted cache-writer events. The CLI
-Dockerfile's `RUN --mount=type=cache,target=/ccache` mount remains local to that
-build and is not exported through the GitHub Actions cache backend.
+Each artifact job builds one Docker image family for each native matrix row.
+Per-run builds use Buildx with `--load` and import two public registry
+refs per family/native target: `<scope>-<event-name>` first and
+`<scope>-baseline` second. Every non-pull-request event, including tag pushes
+and manual dispatch, resolves `<event-name>` to `baseline`; pull requests
+resolve it to `pr-<number>`, so a baseline import never reads a PR-writable ref.
+On canonical `main` pushes and same-repository pull requests,
+separate best-effort export steps write only the event ref with `mode=max`,
+`oci-mediatypes=true`, `image-manifest=true`, and
+`compression=zstd`. Fork pull requests skip GHCR login and every export step,
+and import anonymously from the public cache package, including the warm
+baseline ref. The CLI Dockerfile's
+`RUN --mount=type=cache,target=/ccache` mount is local to that build and is
+not exported through the registry cache.
 
 x86-64-v4 is intentionally absent. GitHub `ubuntu-24.04` runners commonly use
 AMD Zen 3 hosts without AVX-512, and a v4 library SIGILLs in the
 auto-extension constructor. v4-capable amd64 hosts receive the v3 artifact.
 
 Each build output is extracted with the pinned Docker-extract action and
-uploaded as a workflow artifact.
+uploaded as a workflow artifact. `build-cli` builds, checks, and uploads the
+CLI; `build-generic` builds, smokes, and uploads the generic library; and
+`build-plex` does the same for the Plex library. Each artifact job sets
+`fail-fast: false` and uses Buildx `--load`. `build-plex` runs the Plex
+support-window smokes; `build-generic` runs the Emby support-window,
+slow-query, observability-count, and ABI checks; `build-cli` runs the STAT4 EQP
+reproduction.
 
 Mod runtime SHA data is rendered by
 `tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build artifacts,
 same-run runtime baseline extraction, and the Plex pool-patch pins
 (`pins/plex-pool-patch-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
 
-The workflow keeps observability count and ABI obsolete-config checks after
-runtime smokes. The `mod-static-tests` job runs the repo-only LSIO mod test
-suite, including
-`tests/render_lsio_mod_baked_pins_test.sh`,
-`tests/cont_init_fragments_test.sh`, and
-`tests/sqlite_build_workflow_mod_only_test.sh`.
-Mandatory multi-version gates include
-`tests/check_multi_version_pin_alignment.sh` in the workflow, the parser and
-selector suites (`tests/manifest_parser_test.sh` and
-`tests/selector_test.sh`), support-image digest artifacts, and the skopeo OCI
-static check in `tools/ci/skopeo-mod-image-oci-check.sh`.
+The `mod-static-tests` job runs the repo-only LSIO mod, negative, maintenance,
+workflow, release-note rendering, and shellcheck suites, including
+`tests/render_release_notes_test.sh` and
+`tests/check_multi_version_pin_alignment_negative_test.sh`. Mandatory
+multi-version gates include `tests/check_multi_version_pin_alignment.sh` in
+`preflight`, the parser and selector suites, support-image digest artifacts,
+and the skopeo OCI static check in
+`tools/ci/skopeo-mod-image-oci-check.sh`.
 
 ### Release Job
 
-The release job runs only for CalVer tags matching
-`YYYY.MM.DD-rN`. It downloads same-run sqlite artifacts, creates the public
-CLI and library tarballs, writes `SHA256SUMS`, and publishes only:
+The release job runs only for CalVer tags matching `YYYY.MM.DD-rN`. It checks
+out full history, selects the greatest reachable earlier CalVer tag in Git
+version order, and appends oldest-first non-merge commit subjects to the
+existing compatibility body. A first CalVer release and a same-commit revision
+receive explicit text. It then downloads same-run sqlite artifacts, creates the
+public CLI and library tarballs, writes `SHA256SUMS`, and publishes only:
 
 - `sqlite-<tag>-*.tar.gz`
 - `SHA256SUMS`
 
-It does not fetch prior release metadata, assemble runtime manifests, or
-publish runtime mod metadata.
+It reads prior tags and commit subjects only for release notes; it does not
+fetch prior release assets, assemble runtime manifests, or publish runtime mod
+metadata.
 
 ### LSIO Mod Jobs
 
-`mod-build` runs on every push, pull request, and tag; depends on `build`, not
-`release`. It uses a four-lane matrix:
+`mod-build` runs on every push, pull request, and tag; depends on
+`build-generic` and `build-plex`, not `release`. It uses a four-lane matrix:
 
 | Mod | Runner | Arch suffix |
 |---|---|---|
