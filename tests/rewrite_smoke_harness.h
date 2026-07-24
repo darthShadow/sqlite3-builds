@@ -1918,7 +1918,7 @@ static void rsh_run_contract_parity(
     rsh_parity_state.test_case = test_case;
     rsh_parity_state.prepare = spec->prepare;
     rsh_contract_suite = suite;
-    contract_parity_require_min_rows(
+    contract_parity_require_min_rows_mode(
         vendor->db,
         candidate->db,
         rsh_parity_prepare,
@@ -1930,7 +1930,8 @@ static void rsh_run_contract_parity(
         spec->bind_ctx,
         spec->row_exception,
         spec->row_exception_ctx,
-        spec->minimum_rows
+        spec->minimum_rows,
+        1
     );
     rsh_contract_suite = NULL;
     memset(&rsh_parity_state, 0, sizeof(rsh_parity_state));

@@ -64,7 +64,7 @@ static int contract_parity_cell_equal(sqlite3_stmt *left, sqlite3_stmt *right, i
     }
 }
 
-static void contract_parity_require_min_rows(
+static void contract_parity_require_min_rows_mode(
     sqlite3 *vendor_db,
     sqlite3 *candidate_db,
     contract_parity_prepare_fn prepare,
@@ -76,7 +76,8 @@ static void contract_parity_require_min_rows(
     void *bind_ctx,
     contract_parity_row_exception_fn row_exception,
     void *exception_ctx,
-    int minimum_rows
+    int minimum_rows,
+    int require_rewrite
 ) {
     sqlite3_stmt *vendor = NULL;
     sqlite3_stmt *candidate = NULL;
@@ -98,10 +99,18 @@ static void contract_parity_require_min_rows(
         failf("FAIL [%s/vendor-sql]: got=\"%s\" want=\"%s\"", label,
               saved_vendor_sql ? saved_vendor_sql : "(null)", vendor_sql);
     }
-    /* C6: a silent matcher miss must never turn parity into vendor-vs-vendor. */
-    if (!saved_candidate_sql || strcmp(saved_candidate_sql, candidate_source_sql) == 0) {
+    /* C6: ordinary parity cases must prove the rewrite fired.  Explicit
+     * fail-open cases instead prove that the candidate SQL was preserved. */
+    if (!saved_candidate_sql ||
+        (require_rewrite &&
+         strcmp(saved_candidate_sql, candidate_source_sql) == 0)) {
         failf("FAIL [%s/rewrite-fired]: candidate SQL did not change: \"%s\"", label,
               saved_candidate_sql ? saved_candidate_sql : "(null)");
+    }
+    if (!require_rewrite &&
+        strcmp(saved_candidate_sql, candidate_source_sql) != 0) {
+        failf("FAIL [%s/fail-open]: candidate SQL changed: got=\"%s\" want=\"%s\"",
+              label, saved_candidate_sql, candidate_source_sql);
     }
     if (expected_candidate_sql && strcmp(saved_candidate_sql, expected_candidate_sql) != 0) {
         failf("FAIL [%s/candidate-sql]: got=\"%s\" want=\"%s\"", label,
@@ -232,10 +241,27 @@ static void contract_parity_require(
     contract_parity_row_exception_fn row_exception,
     void *exception_ctx
 ) {
-    contract_parity_require_min_rows(
+    contract_parity_require_min_rows_mode(
         vendor_db, candidate_db, prepare, label, vendor_sql,
         candidate_source_sql, expected_candidate_sql, bind, bind_ctx,
-        row_exception, exception_ctx, 1
+        row_exception, exception_ctx, 1, 1
+    );
+}
+
+static void contract_parity_require_fail_open(
+    sqlite3 *vendor_db,
+    sqlite3 *candidate_db,
+    contract_parity_prepare_fn prepare,
+    const char *label,
+    const char *vendor_sql,
+    const char *candidate_source_sql,
+    contract_parity_bind_fn bind,
+    void *bind_ctx
+) {
+    contract_parity_require_min_rows_mode(
+        vendor_db, candidate_db, prepare, label, vendor_sql,
+        candidate_source_sql, candidate_source_sql, bind, bind_ctx,
+        NULL, NULL, 1, 0
     );
 }
 

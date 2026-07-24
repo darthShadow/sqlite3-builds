@@ -530,6 +530,7 @@ static void seed_mixed_latest_identity_rows(sqlite3 *db) {
         "(2051,5,'boundary-a',250,'g-a','p-a',2051),"
         "(2052,8,'boundary-c',250,'g-c','p-c',2052),"
         "(2053,5,'boundary-b',250,'g-b','p-b',2053);"
+        "UPDATE MediaItems SET ProductionYear=2026 WHERE Id=2001;"
         "INSERT INTO AncestorIds2(itemid,AncestorId,Distance) VALUES"
         "(2000,100,0),(2001,100,0),(2002,100,0),(2003,100,0),(2004,100,0),(2005,100,0),"
         "(2010,101,0),(2011,101,0),"
@@ -752,6 +753,10 @@ static const char EMBY_EPISODES_LATEST_SEMANTIC_PROJECTION[] =
     "A.Id,A.Name,A.DateCreated,A.SeriesPresentationUniqueKey,A.PresentationUniqueKey,UserDatas.IsFavorite,UserDatas.Played ";
 static const char EMBY_MIXED_LATEST_PROJECTION[] =
     "A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
+static const char EMBY_MIXED_LATEST_PRODUCTION_YEAR_PROJECTION[] =
+    "A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
+static const char EMBY_MIXED_LATEST_MB1_PROJECTION[] =
+    "A.type,A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
 
 static char *make_movies_latest_sql_form(
     int played_guard,
@@ -864,8 +869,9 @@ static char *make_latest_expected(const char *projection, const char *limit) {
     return make_latest_expected_form(projection, "100", limit);
 }
 
-static char *make_mixed_latest_sql_form(
+static char *make_mixed_latest_sql_projection_form(
     const char *ancestors,
+    const char *projection,
     const char *user_id,
     const char *limit
 ) {
@@ -873,6 +879,16 @@ static char *make_mixed_latest_sql_form(
         "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) )select %s"
         "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%s "
         "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT %s",
+        ancestors, projection, user_id, limit
+    );
+}
+
+static char *make_mixed_latest_sql_form(
+    const char *ancestors,
+    const char *user_id,
+    const char *limit
+) {
+    return make_mixed_latest_sql_projection_form(
         ancestors, EMBY_MIXED_LATEST_PROJECTION, user_id, limit
     );
 }
@@ -881,8 +897,9 @@ static char *make_mixed_latest_sql(const char *user_id, const char *limit) {
     return make_mixed_latest_sql_form("100", user_id, limit);
 }
 
-static char *make_mixed_latest_expected_form(
+static char *make_mixed_latest_expected_projection_form(
     const char *ancestors,
+    const char *projection,
     const char *user_id,
     const char *limit
 ) {
@@ -900,12 +917,22 @@ static char *make_mixed_latest_expected_form(
         "AND ( (B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated > A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) "
         "AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (%s) ) "
         "AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = Args.user_id AND UB.played <> 0 ) ) "
-        "ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ASC LIMIT (SELECT row_limit FROM mixed_latest_args) ) "
+        "ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) DESC LIMIT (SELECT row_limit FROM mixed_latest_args) ) "
         "SELECT %s"
         "FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id CROSS JOIN mixed_latest_args AS Args LEFT JOIN UserDatas "
         "ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = Args.user_id "
-        "ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.gk ASC LIMIT (SELECT row_limit FROM mixed_latest_args)",
-        user_id, limit, ancestors, ancestors, EMBY_MIXED_LATEST_PROJECTION
+        "ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.gk DESC LIMIT (SELECT row_limit FROM mixed_latest_args)",
+        user_id, limit, ancestors, ancestors, projection
+    );
+}
+
+static char *make_mixed_latest_expected_form(
+    const char *ancestors,
+    const char *user_id,
+    const char *limit
+) {
+    return make_mixed_latest_expected_projection_form(
+        ancestors, EMBY_MIXED_LATEST_PROJECTION, user_id, limit
     );
 }
 
@@ -929,6 +956,32 @@ static sqlite3_stmt *contract_prepare_v2(
             "FAIL [%s]: prepare entry=2 rc=%d err=%s",
             label, rc, sqlite3_errmsg(db)
         );
+    }
+    return stmt;
+}
+
+static sqlite3_stmt *contract_prepare_legacy(
+    sqlite3 *db, const char *label, const char *sql, const char **tail
+) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = emby_suite_spec.prepare(
+        db, sql, -1, RSH_PREPARE_LEGACY, &stmt, tail
+    );
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s]: prepare entry=legacy rc=%d err=%s",
+              label, rc, sqlite3_errmsg(db));
+    }
+    return stmt;
+}
+
+static sqlite3_stmt *contract_prepare_v3(
+    sqlite3 *db, const char *label, const char *sql, const char **tail
+) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = emby_suite_spec.prepare(db, sql, -1, RSH_PREPARE_V3, &stmt, tail);
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s]: prepare entry=3 rc=%d err=%s",
+              label, rc, sqlite3_errmsg(db));
     }
     return stmt;
 }
@@ -1034,6 +1087,31 @@ static void expect_mixed_latest_sql(
     }
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {}
     require_int(label, rc, SQLITE_DONE);
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void require_mixed_production_year_row(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char *expected_sql
+) {
+    const char *tail = NULL;
+    sqlite3_stmt *stmt = contract_prepare_v2(db, label, sql, &tail);
+    int found = 0;
+    int rc;
+
+    require_str_eq(label, sqlite3_sql(stmt), expected_sql);
+    require_int(label, tail == sql + strlen(sql), 1);
+    require_int(label, sqlite3_column_count(stmt), 20);
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (sqlite3_column_int64(stmt, 1) != 2001) continue;
+        require_int(label, sqlite3_column_type(stmt, 5), SQLITE_INTEGER);
+        require_int(label, sqlite3_column_int(stmt, 5), 2026);
+        found++;
+    }
+    require_int(label, rc, SQLITE_DONE);
+    require_int(label, found, 1);
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
@@ -5571,8 +5649,9 @@ enum emby_d5b_case_id {
     EMBY_D5B_MIXED_POS_BIND_LITERAL,
     EMBY_D5B_MIXED_POS_LITERAL_BIND,
     EMBY_D5B_MIXED_POS_BIND_BIND,
+    EMBY_D5B_MIXED_POS_REVERSED_TYPES,
     EMBY_D5B_MIXED_NEG_TYPE8,
-    EMBY_D5B_MIXED_NEG_TYPE58,
+    EMBY_D5B_MIXED_NEG_TYPE55,
     EMBY_D5B_MIXED_NEG_TYPE856,
     EMBY_D5B_MIXED_NEG_TYPE_CASE,
     EMBY_D5B_MIXED_NEG_FROM_CASE,
@@ -5677,42 +5756,48 @@ static int rsh_custom_adapter_dashboard_fix_b_c_identity(
         char *scalar = make_latest_sql_form(
             EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
         );
-        char *expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
-        );
-
-        contract_parity_require(
+        contract_parity_require_fail_open(
             vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-episodes-contract", oracle, scalar, expected,
-            NULL, NULL, NULL, NULL
+            "emby-dashboard-episodes-scalar-fail-open-contract",
+            oracle, scalar, NULL, NULL
         );
         free(oracle);
         free(scalar);
-        free(expected);
+    }
+    {
+        const char *ancestors =
+            "100,101,102,103,104,105,106,107,108,109,110,111,112,113,"
+            "114,115,116,117,118,119,120,121,122,123,124,125,126,127,"
+            "128,129";
+        char *wide = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, ancestors, 0, "12"
+        );
+
+        contract_parity_require_fail_open(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-episodes-30-ancestor-fail-open-contract",
+            wide, wide, NULL, NULL
+        );
+        free(wide);
     }
     {
         char ids[32];
         char *scalar = make_latest_sql_form(
             EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
         );
-        char *expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
-        );
-
-        contract_parity_require(
+        contract_parity_require_fail_open(
             vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-episodes-scalar-minus-one-contract",
-            scalar, scalar, expected, NULL, NULL, NULL, NULL
+            "emby-dashboard-episodes-scalar-minus-one-fail-open-contract",
+            scalar, scalar, NULL, NULL
         );
         collect_int_column(
             candidate_db, "dashboard-episodes-scalar-minus-one-ids",
-            scalar, expected, -1, 0, ids, sizeof(ids)
+            scalar, scalar, -1, 0, ids, sizeof(ids)
         );
         require_str_eq(
             "dashboard-episodes-scalar-minus-one-exact-id", ids, "7,"
         );
         free(scalar);
-        free(expected);
     }
     {
         char *oracle = make_movies_latest_sql(1, "100", "42", "12");
@@ -5819,8 +5904,8 @@ static int rsh_matrix_assert_emby_d5b_fix(
             EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
         );
         sql_owned = 1;
-        expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
+        expected = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
         );
         rsh_run_emby_matrix_sql_exact(
             context, matrix_case->label, sql, expected,
@@ -5832,8 +5917,8 @@ static int rsh_matrix_assert_emby_d5b_fix(
             EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
         );
         sql_owned = 1;
-        expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
+        expected = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
         );
         rsh_run_emby_matrix_sql_exact(
             context, matrix_case->label, sql, expected,
@@ -6088,11 +6173,11 @@ static void rsh_run_emby_d5b_mixed_negative(
             "where A.Type=8 ", "where A.Type=8 "
         );
         break;
-    case EMBY_D5B_MIXED_NEG_TYPE58:
+    case EMBY_D5B_MIXED_NEG_TYPE55:
         base = make_mixed_latest_sql("42", "3");
         rsh_run_emby_matrix_generated_negative(
             context, matrix_case->label, base, "where A.Type in (8,5) ",
-            "where A.Type in (5,8) ", "where A.Type in (5,8) "
+            "where A.Type in (5,5) ", "where A.Type in (5,5) "
         );
         break;
     case EMBY_D5B_MIXED_NEG_TYPE856:
@@ -6265,6 +6350,13 @@ static int rsh_matrix_assert_emby_d5b_mixed_positive(
         limit_bound = 1;
     }
     sql = make_mixed_latest_sql(user, limit);
+    if (matrix_case->case_id == EMBY_D5B_MIXED_POS_REVERSED_TYPES) {
+        char *reversed = replace_once(
+            sql, "where A.Type in (8,5) ", "where A.Type in (5,8) "
+        );
+        free(sql);
+        sql = reversed;
+    }
     expected = make_mixed_latest_expected(user, limit);
     expect_mixed_latest_sql(
         candidate, matrix_case->label, sql, expected,
@@ -6552,8 +6644,8 @@ EMBY_DEFINE_MATRIX_AXIS_3(
 EMBY_DEFINE_MATRIX_AXIS_3(
     emby_d5b_fix_positive_2,
     "dashboard-movies-m6-byte-identical", EMBY_D5B_FIX_COMPACT_M6,
-    "dashboard-episodes-e2-scalar", EMBY_D5B_FIX_EPISODES_E2,
-    "dashboard-episodes-scalar-minus-one", EMBY_D5B_FIX_EPISODES_MINUS_ONE
+    "dashboard-episodes-e2-scalar-fail-open", EMBY_D5B_FIX_EPISODES_E2,
+    "dashboard-episodes-scalar-minus-one-fail-open", EMBY_D5B_FIX_EPISODES_MINUS_ONE
 );
 EMBY_DEFINE_MATRIX_AXIS_2(
     emby_d5b_fix_positive_3,
@@ -6694,10 +6786,14 @@ EMBY_DEFINE_MATRIX_AXIS_1(
     emby_d5b_mixed_positive_2,
     "dashboard-mixed-latest-bind-3", EMBY_D5B_MIXED_POS_BIND_BIND
 );
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_positive_reversed,
+    "dashboard-mixed-latest-reversed-types", EMBY_D5B_MIXED_POS_REVERSED_TYPES
+);
 EMBY_DEFINE_MATRIX_AXIS_3(
     emby_d5b_mixed_probe_negatives,
     "dashboard-mixed-negative-0", EMBY_D5B_MIXED_NEG_TYPE8,
-    "dashboard-mixed-negative-1", EMBY_D5B_MIXED_NEG_TYPE58,
+    "dashboard-mixed-negative-1", EMBY_D5B_MIXED_NEG_TYPE55,
     "dashboard-mixed-negative-2", EMBY_D5B_MIXED_NEG_TYPE856
 );
 EMBY_DEFINE_MATRIX_AXIS_3(
@@ -6758,6 +6854,11 @@ static const rsh_matrix_phase_spec emby_dashboard_mixed_latest_matrix_phases[] =
     EMBY_DYNAMIC_MATRIX_PHASE(
         "mixed-positive-2", "mixed-positive-2",
         emby_d5b_mixed_positive_2_axes, emby_d5b_mixed_all_dbs,
+        rsh_matrix_assert_emby_d5b_mixed_positive, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "mixed-positive-reversed", "mixed-positive-reversed",
+        emby_d5b_mixed_positive_reversed_axes, emby_d5b_mixed_all_dbs,
         rsh_matrix_assert_emby_d5b_mixed_positive, 1
     ),
     EMBY_D5B_CASE_MATRIX_PHASE(
@@ -7447,12 +7548,115 @@ static int rsh_custom_adapter_dashboard_mixed_identity(
     typed_rows vendor_rows;
     typed_rows candidate_rows;
     char ids[128];
+    static contract_parity_prepare_fn const prepare_entries[] = {
+        contract_prepare_legacy, contract_prepare_v2, contract_prepare_v3
+    };
+    static const char *const prepare_labels[] = {"legacy", "v2", "v3"};
+    static const char *const projections[] = {
+        EMBY_MIXED_LATEST_PROJECTION,
+        EMBY_MIXED_LATEST_PRODUCTION_YEAR_PROJECTION,
+        EMBY_MIXED_LATEST_MB1_PROJECTION
+    };
+    static const int projection_columns[] = {19, 20, 22};
+    size_t projection_i;
+    size_t prepare_i;
 
     (void)immutable_data;
     if (!context->matrix_cell || context->matrix_cell->axis_count != 1) {
         failf("FAIL [dashboard-mixed-identity/matrix-context]");
     }
     analyzed = context->matrix_cell->axis_indices[0] == 1;
+
+    require_int(
+        "mixed-production-year/vendor-fixture",
+        query_int(
+            vendor_db, "mixed-production-year/vendor-fixture-sql",
+            "SELECT ProductionYear FROM MediaItems WHERE Id=2001"
+        ),
+        2026
+    );
+    require_int(
+        "mixed-production-year/candidate-fixture",
+        query_int(
+            candidate_db, "mixed-production-year/candidate-fixture-sql",
+            "SELECT ProductionYear FROM MediaItems WHERE Id=2001"
+        ),
+        2026
+    );
+
+    for (projection_i = 0;
+         projection_i < sizeof(projections) / sizeof(projections[0]);
+         projection_i++) {
+        raw = make_mixed_latest_sql_projection_form(
+            "100", projections[projection_i], "42", "20"
+        );
+        expected = make_mixed_latest_expected_projection_form(
+            "100", projections[projection_i], "42", "20"
+        );
+        for (prepare_i = 0;
+             prepare_i < sizeof(prepare_entries) / sizeof(prepare_entries[0]);
+             prepare_i++) {
+            char label[128];
+            snprintf(
+                label, sizeof(label),
+                "mixed-%dcol-limit20-%s%s",
+                projection_columns[projection_i], prepare_labels[prepare_i],
+                analyzed ? "-after-analyze" : "-before-analyze"
+            );
+            contract_parity_require(
+                vendor_db, candidate_db, prepare_entries[prepare_i], label,
+                raw, raw, expected, NULL, NULL, NULL, NULL
+            );
+        }
+        free(raw);
+        free(expected);
+    }
+
+    raw = make_mixed_latest_sql_projection_form(
+        "100", EMBY_MIXED_LATEST_PRODUCTION_YEAR_PROJECTION, "42", "20"
+    );
+    expected = make_mixed_latest_expected_projection_form(
+        "100", EMBY_MIXED_LATEST_PRODUCTION_YEAR_PROJECTION, "42", "20"
+    );
+    require_mixed_production_year_row(
+        vendor_db, "mixed-production-year/vendor-result", raw, raw
+    );
+    require_mixed_production_year_row(
+        candidate_db, "mixed-production-year/candidate-result", raw, expected
+    );
+    free(raw);
+    free(expected);
+
+    raw = make_mixed_latest_sql_projection_form(
+        "100", EMBY_MIXED_LATEST_MB1_PROJECTION, "42", "20"
+    );
+    {
+        char *production_order = replace_once(
+            raw, "where A.Type in (8,5) ", "where A.Type in (5,8) "
+        );
+        free(raw);
+        raw = production_order;
+    }
+    expected = make_mixed_latest_expected_projection_form(
+        "100", EMBY_MIXED_LATEST_MB1_PROJECTION, "42", "20"
+    );
+    for (prepare_i = 0;
+         prepare_i < sizeof(prepare_entries) / sizeof(prepare_entries[0]);
+         prepare_i++) {
+        char label[128];
+        snprintf(
+            label, sizeof(label), "mixed-mb1-exact-limit20-%s%s",
+            prepare_labels[prepare_i],
+            analyzed ? "-after-analyze" : "-before-analyze"
+        );
+        contract_parity_require(
+            vendor_db, candidate_db, prepare_entries[prepare_i], label,
+            raw, raw, expected, NULL, NULL, NULL, NULL
+        );
+    }
+    free(raw);
+    free(expected);
+
     raw = make_mixed_latest_sql("42", "3");
     expected = make_mixed_latest_expected("42", "3");
     vendor_rows = collect_typed_rows(
@@ -7540,9 +7744,12 @@ static int rsh_custom_adapter_dashboard_mixed_identity(
         "105", "mixed-same-date-lower-id",
         "mixed-same-date-lower-id/selection", "2039,"
     );
+    /* The optimized plan resolves equal DateCreated groups in descending
+     * group-key order.  Lock that LIMIT-boundary behavior independently of
+     * the synthetic fixture's planner/index state. */
     EMBY_D6_MIXED_ID_ASSERT(
         "104", "mixed-limit-boundary-gk", "mixed-limit-boundary-gk/order",
-        "2051,2053,2052,"
+        "2050,2052,2053,"
     );
 
 #undef EMBY_D6_MIXED_ID_ASSERT
